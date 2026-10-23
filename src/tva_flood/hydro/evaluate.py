@@ -17,14 +17,11 @@ diagnostic, not a forecast.
    it) takes the model of that gauge's fold, so held-out basins are forecast without their
    gauge; other reaches take the all-gauge model. The NWM forecast at every reach is the
    reference (``models/retrospective_comparison_gefs_nwm``), the LSTM run at every reach
-   (``scripts/lstm_every_reach.py``) another. Scopes include the reaches behind dams.
-4. Dams (models with a reservoir module): the all-gauge model's forecast releases and
-   reservoir inflows (daily means: TVA computes inflow from storage changes) against TVA's
-   observed ones, at the dams with TVA forecasts, next to TVA's own forecast in force at
-   the issue (issued at or before it) and persistence of the latest observed value.
+   (``scripts/lstm_every_reach.py``) another.
 
-Gauged and ungauged results are also split into free-flowing gauges and gauges with more
-than half their basin behind a dam above them.
+Results are also split by the TVA dams (``hydro-dams``; the model never reads them): gauges
+in headwater basins without a dam, below another gauge without a dam, and with a dam in the
+basin; reaches with more than half their basin behind a dam, and free-flowing large rivers.
 
 Outputs in --out: report.md, gauged.csv, ungauged.csv, reaches.csv (medians by scope and
 drainage area), reach_metrics.npz, forecasts_gauged.npz and forecasts_ungauged.npz.
@@ -50,7 +47,7 @@ from tva_flood.evaluation.hydrology import Accumulator, reach_metrics
 from . import paths as P
 from .data import timeline_index
 from .legacy import HydroModelV1
-from .model import HydroModel, RegulatedModel
+from .model import HydroModel
 from .samples import Device, Samples
 
 FUTURE = slice(P.INNOVATION, P.SCORED)
@@ -64,13 +61,10 @@ AREA_CLASSES = (("< 50 km2", 0, 50), ("50-500", 50, 500), ("500-5,000", 500, 500
 def load_model(path, s, device, legacy=False):
     state = torch.load(path, map_location="cpu", weights_only=False)
     c = state["config"]
-    if c.get("kind") == "regulated":
-        model = RegulatedModel(c["groups"], c["delay"], c["dams"], c["hidden"], c["channels"], c["graph_layers"], c["pool_layers"], c["plan"])
-    else:
-        model = (HydroModelV1 if legacy else HydroModel)(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"])
+    model = (HydroModelV1 if legacy else HydroModel)(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"])
     model.load_state_dict(state["model"])
     model.to(device).eval()
-    model.attach(s.network, s.network.edges, s.gauges.reach, device, s.dams if c.get("kind") == "regulated" else None)
+    model.attach(s.network, s.network.edges, s.gauges.reach, device)
     return model, state
 
 
@@ -125,16 +119,27 @@ def reach_folds(s):
     return np.where(owner >= 0, gauge_fold[np.maximum(owner, 0)], -1), gauge_fold
 
 
-def reach_table(series, reach_fold, network, regulated=None):
-    """Median NSE by lead and scope (all reaches, held-out basins, by size and, with
-    ``regulated`` [reach], behind dams or free-flowing) for each series [lead, reach]: a
-    DataFrame, its markdown lines."""
+def regulation(network, gauges):
+    """Share of each reach's basin whose water passes a TVA dam first, and the gauge groups:
+    headwater without a dam, below another gauge without a dam, a dam in the basin."""
+    with np.load(P.HYDRO / "dams.npz") as d:
+        regulated, dam_reach = d["regulated"], d["reach"]
+    gauge_at, dam_at = np.zeros(network.n, bool), np.zeros(network.n, bool)
+    gauge_at[gauges.reach], dam_at[dam_reach] = True, True
+    dammed = np.array([dam_at[b].any() for b in gauges.basins]) | (regulated[gauges.reach] > 0)
+    nested = np.array([gauge_at[b].sum() > 1 for b in gauges.basins])
+    groups = (("headwater, no dam", ~nested & ~dammed), ("below a gauge, no dam", nested & ~dammed), ("dam in the basin", dammed))
+    return regulated, groups
+
+
+def reach_table(series, reach_fold, network, regulated):
+    """Median NSE by lead and scope (all reaches, held-out basins, by size, behind dams,
+    free-flowing large rivers) for each series [lead, reach]: a DataFrame, its markdown lines."""
     area = pd.read_parquet(P.PROCESSED / "graph_candidate/nodes.parquet", columns=["comid", "totdasqkm"]).set_index("comid").totdasqkm.reindex(network.ids).to_numpy()
     held_basin = reach_fold > 0
     scopes = [("all reaches", np.ones(network.n, bool)), ("held-out basins", held_basin), ("outside every gauge basin", reach_fold == -1)]
     scopes += [(f"held-out basins, {c}", held_basin & (area >= lo) & (area < hi)) for c, lo, hi in AREA_CLASSES]
-    if regulated is not None:
-        scopes += [("behind dams (> 50% of basin)", regulated > 0.5), ("free-flowing, > 500 km2", (regulated <= 0) & (area >= 500))]
+    scopes += [("behind dams (> 50% of basin)", regulated > 0.5), ("free-flowing, > 500 km2", (regulated <= 0) & (area >= 500))]
     table = []
     for lead in (24, 72, 120):
         for scope, m in scopes:
@@ -152,11 +157,11 @@ def reach_table(series, reach_fold, network, regulated=None):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--model", type=Path, default=P.MODELS / "v3_B/best.pt")
-    p.add_argument("--fold-models", default=str(P.MODELS / "v3_B_f{k}/best.pt"))
+    p.add_argument("--model", type=Path, default=P.MODELS / "gefs_hydro_B/best.pt")
+    p.add_argument("--fold-models", default=str(P.MODELS / "gefs_hydro_B_f{k}/best.pt"))
     p.add_argument("--legacy", action="store_true", help="The checkpoints are V1 (models/hydro_v1): residual head")
     p.add_argument("--rain-steps", type=int, default=P.HORIZON, help="Forecast rain known to this lead (V1: 16)")
-    p.add_argument("--label", default="V3", help="Name of the scored model in the report")
+    p.add_argument("--label", default="new model", help="Name of the scored model in the report")
     p.add_argument("--min-count", type=int, default=100)
     p.add_argument("--limit", type=int, default=0, help="First n issues only (testing)")
     a = p.parse_args()
@@ -178,7 +183,7 @@ def evaluate(a, rank, world, device):
     out = a.out.resolve()
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
-    gpu = Device(network, gauges, arrays, device, s.dams)
+    gpu = Device(network, gauges, arrays, device)
     models = {0: load_model(a.model, s, device, a.legacy)[0]}
     for k in range(1, FOLDS + 1):
         model, state = load_model(Path(a.fold_models.format(k=k)), s, device, a.legacy)
@@ -206,10 +211,7 @@ def evaluate(a, rank, world, device):
         gauged={m: Accumulator(g, device) for m in gauged_names},
         ungauged={m: Accumulator(g, device) for m in ungauged_names},
         reach={m: Accumulator(network.n, device) for m in ["hydro+gefs", "hydro+aorc", "retro_persistence"]},
-        release={m: Accumulator(s.dams.count, device) for m in ["model", "tva", "persistence"]},
-        inflow={m: Accumulator(s.dams.count, device) for m in ["model", "tva", "persistence"]},
     )
-    has_dams = isinstance(models[0], RegulatedModel)
     kept = dict(gauged=[], ungauged=[])
     began = time.perf_counter()
     with torch.inference_mode(), torch.autocast("cuda", torch.bfloat16):
@@ -247,8 +249,6 @@ def evaluate(a, rank, world, device):
                     flow = result["gauge"][:, FUTURE].T.double()
                     if k == 0:
                         values[f"hydro+{tag}"] = flow
-                        if has_dams and tag == "gefs":
-                            add_dams(acc, result, batch, s.dams, step, device)
                     else:
                         held = torch.as_tensor(withheld[k], device=device)
                         prior = values.get(f"ungauged+{tag}", torch.zeros_like(flow))
@@ -287,30 +287,6 @@ def evaluate(a, rank, world, device):
         write(a, out, s, acc, issues, every_reach, reach_fold, world)
 
 
-def daily(x):
-    """Six-hour series [lead, dam] as their daily means, each repeated over its day's leads."""
-    days = x.shape[0] // P.STEPS_PER_DAY
-    return x.reshape(days, P.STEPS_PER_DAY, -1).mean(dim=1).repeat_interleave(P.STEPS_PER_DAY, dim=0)
-
-
-def add_dams(acc, result, b, dams, step, device):
-    """Protocol 4 at one issue: forecast releases and daily reservoir inflows against TVA's
-    observed ones, next to TVA's forecast in force and persistence; dams with a TVA forecast."""
-    for name, forecast, record, plan in (
-        ("release", result["release"].T, b["release"], dams.planned(step)),
-        ("inflow", result["inflow"][:, FUTURE].T, b["dam_inflow"], dams.planned(step, inflow=True)),
-    ):
-        truth = record[P.HISTORY : P.WINDOW].double()
-        latest = record[P.HISTORY - 1].double()
-        tva = torch.as_tensor(plan, device=device).double()
-        if name == "inflow":  # TVA computes inflow from storage changes: score daily means
-            truth, tva, forecast = daily(truth), daily(tva), daily(forecast.double())
-        mask = torch.isfinite(truth) & torch.isfinite(tva) & torch.isfinite(latest)[None]
-        truth0 = torch.nan_to_num(truth)
-        for method, value in (("model", forecast), ("tva", tva), ("persistence", latest[None].expand_as(truth))):
-            acc[name][method].add(torch.nan_to_num(value.double()), truth0, mask)
-
-
 def _keep(step, truth, mask, values):
     nan = torch.tensor(float("nan"), device=truth.device, dtype=torch.float64)
     return dict(
@@ -330,14 +306,6 @@ def _stack(rows):
     )
 
 
-def _by_station(saved, names):
-    """Saved NSE (``saved_nse`` value: nse [lead, station], stations) on the catalog order."""
-    nse, stations = saved
-    full = np.full((nse.shape[0], len(names)), np.nan)
-    full[:, pd.Index(names).get_indexer(stations)] = nse
-    return full
-
-
 def gauge_table(accumulators, min_count):
     """Median NSE over scored gauges by lead, per method."""
     rows = {}
@@ -351,6 +319,19 @@ def medians(nse, scored=None):
     v = np.where(scored, nse, np.nan) if scored is not None else nse
     with np.errstate(all="ignore"):
         return np.nanmedian(v, axis=-1)
+
+
+def days_1_5(nse, scored, gauges):
+    """Mean over leads 24-120 h of the median NSE [lead, gauge] over the selected gauges."""
+    return float(np.mean(medians(nse[:, gauges], None if scored is None else scored[:, gauges])[[h // 6 - 1 for h in DAYS_1_5]]))
+
+
+def _by_station(saved, names):
+    """Saved NSE (``saved_nse`` value: nse [lead, station], stations) on the catalog order."""
+    nse, stations = saved
+    full = np.full((nse.shape[0], len(names)), np.nan)
+    full[:, pd.Index(names).get_indexer(stations)] = nse
+    return full
 
 
 def saved_nse(path, methods, steps, times, min_count):
@@ -466,19 +447,22 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
         rows.append(row(f"{name} (reference: may use these gauges)", medians(nse, scored)))
     count = int(np.isfinite(np.where(mine_u["hydro+gefs"][1], mine_u["hydro+gefs"][0], np.nan)[3]).sum())
     lines += ["", f"## 2. Ungauged: {count} held-out gauges (5 folds) against USGS", ""] + rows
-    # By regulation -----------------------------------------------------------------------
-    regulated = s.dams.regulated[gauges.reach]
-    lstm_g, lstm_u = old.get("lstm+gefs"), old_u.get("lstm+gefs")
-    lines += ["", "By regulation (days 1-5, GEFS rain; share of the gauge's basin behind a dam above it):", "",
-              "| protocol | gauges | " + f"{a.label} | LSTM | NWM |", "|---|---|---:|---:|---:|"]
-    for protocol, table_, lstm_nse, keep in (("gauged", mine, lstm_g, np.ones(gauges.count, bool)), ("ungauged", mine_u, lstm_u, held)):
-        for scope, m in (("free-flowing", regulated <= 0), ("partly (<= 50%)", (regulated > 0) & (regulated <= 0.5)), ("behind dams (> 50%)", regulated > 0.5)):
+    # By dams ----------------------------------------------------------------------------
+    regulated, groups = regulation(network, gauges)
+    lines += ["", "By dams (days 1-5, GEFS rain):", "", f"| protocol | gauges | {a.label} | LSTM | NWM |", "|---|---|---:|---:|---:|"]
+    for protocol, table_, lstm_nse, keep in (
+        ("gauged", mine, old.get("lstm+gefs"), np.ones(gauges.count, bool)),
+        ("ungauged", mine_u, old_u.get("lstm+gefs"), held),
+    ):
+        if protocol == "gauged" and lstm_nse is not None:
+            lstm_nse = _by_station(lstm_nse, names)
+        for scope, m in groups:
             m = m & keep
-            days = lambda nse, scored=None: np.mean(medians(np.where(scored, nse, np.nan)[:, m] if scored is not None else nse[:, m])[[h // 6 - 1 for h in DAYS_1_5]])  # noqa: E731
-            lstm_value = "-" if lstm_nse is None else f"{days(lstm_nse if protocol == 'ungauged' else _by_station(lstm_nse, names)):.3f}"
             nse, scored = table_["hydro+gefs"]
+            cells = [days_1_5(nse, scored, m), days_1_5(*table_["nwm"], m)]
+            lstm_cell = "-" if lstm_nse is None else f"{days_1_5(lstm_nse, None, m):.3f}"
             count = int(scored[DAYS_1_5[0] // 6 - 1][m].sum())  # gauges scored at 24 h
-            lines.append(f"| {protocol} | {scope} ({count}) | {days(nse, scored):.3f} | {lstm_value} | {days(*table_['nwm']):.3f} |")
+            lines.append(f"| {protocol} | {scope} ({count}) | {cells[0]:.3f} | {lstm_cell} | {cells[1]:.3f} |")
     pd.DataFrame(
         [dict(method=n, lead_h=h, station=st, nse=nse[h // 6 - 1, i]) for n, (nse, _) in mine_u.items() for h in LEADS for i, st in enumerate(names)]
     ).to_csv(out / "ungauged.csv", index=False)
@@ -501,20 +485,10 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
         "NWM forecast": nwm_ref["reach/nwm_forecast/nse"],
         "retrospective persistence (oracle)": metrics["retro_persistence"]["nse"],
     })
-    table, rows = reach_table(series, reach_fold, network, s.dams.regulated)
+    table, rows = reach_table(series, reach_fold, network, regulated)
     table.to_csv(out / "reaches.csv", index=False)
     lines += ["", f"## 3. Every reach against the NWM v3.0 retrospective ({len(every_reach)} issues to 2023-01-20)", ""] + rows
     np.savez_compressed(out / "reach_metrics.npz", comid=network.ids, reach_fold=reach_fold, **{f"{k}/nse": v for k, v in series.items()})
-    # 4. Dams ----------------------------------------------------------------------------
-    if acc["release"]["model"].sums[..., 0].sum() > 0:
-        lines += ["", "## 4. Dams: forecast releases and reservoir inflows against TVA's observed ones", "",
-                  "Dams with a TVA forecast in force at the issue (issued at or before it); inflow as daily means.", ""]
-        for name in ("release", "inflow"):
-            table_ = gauge_table(acc[name], a.min_count)
-            rows = header(f"{name} (median NSE over dams)")
-            for method, label in (("model", f"**{a.label}**+gefs"), ("tva", "TVA forecast"), ("persistence", "persistence")):
-                rows.append(row(label, medians(*table_[method])))
-            lines += rows + [""]
     lines += ["", "Median NSE per lead (six-hour means). Days 1-5: mean of the medians at 24-120 h."]
     report = "\n".join(lines) + "\n"
     (out / "report.md").write_text(report)

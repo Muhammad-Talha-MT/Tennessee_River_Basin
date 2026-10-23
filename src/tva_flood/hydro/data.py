@@ -147,65 +147,6 @@ class Gauges:
         return owner
 
 
-class Dams:
-    """TVA dams on the graph (``hydro.dams``): their reaches, observed releases and inflows on
-    the timeline, TVA's forecast releases, and how every reach's water passes them."""
-
-    def __init__(self, network, times):
-        with np.load(P.HYDRO / "dams.npz") as d:
-            if pd.Timestamp(str(d["start"])) != times[0] or d["release"].shape[0] != len(times):
-                raise ValueError("dams.npz was built for another timeline (rerun hydro-dams)")
-            if not np.array_equal(d["comid"], network.ids[d["reach"]]):
-                raise ValueError("dams.npz was built for another reach order")
-            self.names = d["dam"].astype(str)
-            self.reach = d["reach"].astype(np.int64)
-            self.downstream = d["downstream"].astype(np.int64)  # next dam below (-1: none)
-            self.release = d["release"]  # [time, dam] m3/s, NaN missing
-            self.inflow = d["inflow"]  # computed by TVA from release and storage change
-            self.plan = d["forecast_release"]  # TVA forecast release [issue, lead, dam]
-            self.plan_inflow = d["forecast_inflow"]  # TVA forecast inflow [issue, lead, dam]
-            self.plan_index = {int(s): k for k, s in enumerate(d["forecast_issue"])}
-            self.regulated = d["regulated"]  # share of each reach's basin behind a dam above it
-            self.dam_below = d["dam_below"]  # first dam on each reach's way down (-1: none)
-        self.count = len(self.names)
-        train = times < P.TRAIN_UNTIL
-        with np.errstate(invalid="ignore"):
-            # At least 1 m3/s: Tellico releases almost nothing (its water takes a canal).
-            self.mean_raw = np.maximum(np.nan_to_num(np.nanmean(self.release[train], axis=0), nan=1.0), 1.0).astype(np.float32)
-            self.std_raw = np.nan_to_num(np.nanstd(self.release[train], axis=0), nan=1.0).astype(np.float32)
-        # Upstream dams first: a dam's inflow forecast needs the releases of the dams above it.
-        self.level = np.zeros(self.count, dtype=np.int64)
-        for _ in range(self.count):
-            for k, below in enumerate(self.downstream):
-                if below >= 0:
-                    self.level[below] = max(self.level[below], self.level[k] + 1)
-        # Running sums of inflow minus release: storage change over any window in O(1).
-        imbalance = np.nan_to_num(self.inflow.astype(np.float64) - self.release.astype(np.float64))
-        self.stored = np.vstack([np.zeros((1, self.count)), np.cumsum(imbalance, axis=0)])
-
-    def storage(self, step, days=(30, 90)):
-        """Mean inflow minus release over the last ``days`` before ``step``, in mean releases [len(days), dam]."""
-        out = []
-        for d in days:
-            span = min(step, d * P.STEPS_PER_DAY)
-            out.append((self.stored[step] - self.stored[step - span]) / (max(span, 1) * self.mean_raw))
-        return np.stack(out).astype(np.float32)
-
-    def planned(self, step, max_age=P.STEPS_PER_DAY, inflow=False):
-        """TVA's forecast release (or ``inflow``) [lead, dam] in force at ``step``: the latest
-        issued at or before it, at most ``max_age`` steps earlier (TVA issues four times a day,
-        a 00Z forecast exists on about two days in three), its leads shifted to start at
-        ``step``. NaN where none (or past the 240 h kept)."""
-        source = self.plan_inflow if inflow else self.plan
-        out = np.full((P.HORIZON, self.count), np.nan, np.float32)
-        for age in range(max_age + 1):
-            k = self.plan_index.get(int(step) - age)
-            if k is not None:
-                out[: P.HORIZON - age] = source[k, age:]
-                break
-        return out
-
-
 class Rain:
     """Future rain per reach (mm, NaN unknown) by source and issue day."""
 

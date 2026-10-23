@@ -1,35 +1,29 @@
-"""Training of the regulated graph-routing model (``RegulatedModel``) on all GPUs (torchrun):
-stage A (pre-training on NWM and the dams) and stage B (forecast).
+"""Training on all GPUs (torchrun): stage A (pre-training on NWM) and stage B (forecast).
 
 Every sample is a forecast at a 00Z issue: observed weather (AORC) before the issue and,
 after it, only GEFSv12 reforecast rain to 240 h (other future weather unknown). Training
 issues are the reforecast days whose targets end before 2019 (2000-2018); selection uses
-2019 the same way. The TVA dams' observed releases and inflows are inputs before the issue
-and targets after it, in both stages.
+2019 the same way.
 
 Stage A, pre-training: no gauges. Loss: the simulation head against the NWM v3.0
-retrospective over the scored window (8 days before the issue and the 10 days after), a
-bounded NSE per reach (raw and log flow), at reaches outside the dams' reach (weighted by
-the share of the basin not behind a dam: NWM does not know TVA's releases); plus the
-forecast releases against the observed ones and each reservoir's routed inflow against
-TVA's (daily means: TVA computes it from storage changes). It learns runoff, basin
-pooling, routing and the reservoirs.
+retrospective at every reach over the scored window (8 days before the issue and the 10
+days after), a bounded NSE per reach (raw and log flow). It learns runoff, graph mixing
+and routing.
 
-Stage B, forecast (trunk, simulation head, routing and reservoirs from stage A; other heads
-fresh). Each sample shows 30 days of flow at a random half of the eligible gauges (none in
-15% of samples); the loss covers every training gauge, shown or not, so one model learns
-both the gauged and the ungauged case. Loss = gauge forecasts (gauge head and routed
-observed head with the corrections from visible gauges above; leads 1-40, flows above the
-gauge's 90th percentile x3) + 0.3 x NWM prior (as in stage A; the observed head at a tenth
-inside visible gauges' basins) + 0.5 x dams (as in stage A) + 0.1 x spread + 0.01 x mean
-squared observed-head correction.
+Stage B, forecast (trunk, simulation head and routing from stage A; other heads fresh).
+Each sample shows 30 days of flow at a random half of the eligible gauges (none in 15% of
+samples); the loss covers every training gauge, shown or not, so one model learns both
+the gauged and the ungauged case. Loss = gauge forecasts (gauge head and routed observed
+head; leads 1-40, flows above the gauge's 90th percentile x3) + 0.3 x NWM prior over the
+scored window (simulation head everywhere; observed head at a tenth inside visible gauges'
+basins) + 0.1 x spread + 0.01 x mean squared observed-head correction.
 A fold (``--fold k``) withholds that fold's gauges from everything: targets, inputs and
-model selection (the dams are never withheld).
+model selection.
 
 Selection (stage B): on 2019 issues, the mean of (1) median NSE at training gauges with
-their history shown, (2) the same with every history hidden, (3) median NSE against the
-NWM retrospective over all reaches and (4) median NSE of the forecast releases over the
-dams; each averaged over leads 24, 48, 72, 96 and 120 h. Stage A selects on its loss.
+their history shown, (2) the same with every history hidden, and (3) median NSE against
+the NWM retrospective over all reaches; each averaged over leads 24, 48, 72, 96 and 120 h.
+Stage A selects on its NWM loss.
 
   torchrun --standalone --nproc_per_node 4 -m tva_flood.hydro.train --stage A --out DIR
 """
@@ -55,7 +49,7 @@ from tva_flood.training.runtime import save_atomic
 
 from . import paths as P
 from .data import timeline_index
-from .model import RegulatedModel
+from .model import HydroModel
 from .samples import Device, Samples
 
 DAYS_1_5 = [3, 7, 11, 15, 19]  # lead indices of 24, 48, 72, 96, 120 h
@@ -151,23 +145,6 @@ def nwm_loss(sim, b, arrays, steps, rows=None):
     return bounded_nse(sim[:, steps], target, valid, var, b["eps"], rows=rows)
 
 
-def dam_loss(release, inflow, b):
-    """Forecast releases [dam, lead] against the observed ones, and each reservoir's routed
-    inflow [dam, S] against TVA's in daily means (computed from storage changes, TVA's
-    six-hour inflow is noisy), dam by dam."""
-    var = b["dam_std_raw"] ** 2 + 1e-4
-    observed = b["release"][LEADS].T
-    released = bounded_nse(release, torch.nan_to_num(observed).clamp_min(0), torch.isfinite(observed), var, b["dam_eps"])
-    target = b["dam_inflow"][P.HISTORY - P.INNOVATION : P.WINDOW].T.float()
-    days = target.shape[1] // P.STEPS_PER_DAY
-    target = target.reshape(-1, days, P.STEPS_PER_DAY)
-    valid = torch.isfinite(target).all(dim=-1)
-    daily = torch.nan_to_num(target).mean(dim=-1).clamp_min(0)
-    routed = inflow.reshape(-1, days, P.STEPS_PER_DAY).mean(dim=-1)
-    arrived = bounded_nse(routed, daily, valid, var, b["dam_eps"])
-    return released, arrived
-
-
 def gauge_loss(gauge, sigma, b, use):
     """Forecast at gauges ``use`` [G] over the leads, gauge by gauge, flows above each gauge's
     training 90th percentile weighted x3 (floods); and the spread NLL."""
@@ -214,25 +191,20 @@ def validate(model, gpu, stage, fold, rank, world, arrays):
     results = {}
     with torch.inference_mode(), torch.autocast("cuda", torch.bfloat16):
         if stage == "A":
-            total = torch.zeros(4, dtype=torch.float64, device=gpu.device)
+            total = torch.zeros(2, dtype=torch.float64, device=gpu.device)
             for step in entries:
                 b = gpu.batch(s.build(step, "gefs_reforecast"))
                 out = model(b)
-                released, arrived = dam_loss(out["release"], out["inflow"], b)
-                total[0] += nwm_loss(out["sim"], b, arrays, slice(None), rows=1 - b["regulated"]).double()
-                total[1] += released.double()
-                total[2] += arrived.double()
-                total[3] += 1
+                total[0] += nwm_loss(out["sim"], b, arrays, slice(None)).double()
+                total[1] += 1
             if dist.is_initialized():
                 dist.all_reduce(total)
-            for k, name in enumerate(("nwm_loss", "release_loss", "inflow_loss")):
-                results[name] = float(total[k] / total[3])
-            results["score"] = -(results["nwm_loss"] + results["release_loss"] + 0.5 * results["inflow_loss"])
+            results["nwm_loss"] = float(total[0] / total[1])
+            results["score"] = -results["nwm_loss"]
         else:
             gauged = Sums(s.gauges.count, P.HORIZON, gpu.device)
             hidden = Sums(s.gauges.count, P.HORIZON, gpu.device)
             reaches = Sums(s.network.n, 3, gpu.device)
-            dams = Sums(s.dams.count, P.HORIZON, gpu.device)
             use = torch.as_tensor(trained, device=gpu.device)
             for step in entries:
                 shown = s.eligible(step, withheld)
@@ -248,15 +220,12 @@ def validate(model, gpu, stage, fold, rank, world, arrays):
                         target = torch.expm1(z.double() * arrays.std[8] + arrays.mean[8]).clamp_min(0)
                         ok = b["nwm_valid"][FUTURE][[3, 11, 19]].T.bool()
                         reaches.add(out["reach"][:, FUTURE][:, [3, 11, 19]], target, ok)
-                        released = b["release"][LEADS].T
-                        dams.add(out["release"], released, torch.isfinite(released))
             for name, sums in (("gauged", gauged), ("hidden", hidden)):
                 nse = sums.nse(min_count=30)[:, DAYS_1_5]
                 results[name] = float(np.nanmean(np.nanmedian(nse[trained], axis=0)))
             reach_nse = reaches.nse(min_count=30)
             results["reaches"] = float(np.nanmean(np.nanmedian(reach_nse, axis=0)))
-            results["dams"] = float(np.nanmean(np.nanmedian(dams.nse(min_count=30)[:, DAYS_1_5], axis=0)))
-            results["score"] = (results["gauged"] + results["hidden"] + results["reaches"] + results["dams"]) / 4
+            results["score"] = (results["gauged"] + results["hidden"] + results["reaches"]) / 3
     model.train()
     return results
 
@@ -272,7 +241,6 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--nwm-weight", type=float, default=0.3)
-    p.add_argument("--dam-weight", type=float, default=0.5, help="Stage B: dam releases and inflows")
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--delta-weight", type=float, default=0.01, help="Observed-head penalty")
     p.add_argument("--validate-every", type=int, default=1000)
@@ -299,14 +267,14 @@ def train(a, rank, world, device):
         atomic_json(out / "arguments.json", {k: str(v) for k, v in vars(a).items()})
     s = samples()
     arrays = s.arrays
-    model = RegulatedModel(s.network.groups, s.network.delay, s.dams.count, hidden=a.hidden).to(device)
-    if a.init:  # what stage A trains; the gauge, observed and spread heads start fresh
+    model = HydroModel(s.network.groups, s.network.delay, hidden=a.hidden).to(device)
+    if a.init:  # stage A trains runoff and routing only; every head starts fresh
         state = torch.load(a.init, map_location="cpu", weights_only=False)
-        stage_a = ("trunk.", "simulation.", "router.", "reservoir.")
+        stage_a = ("trunk.", "simulation.", "router.")  # what stage A trains; heads start fresh
         shared = {k: v for k, v in state["model"].items() if k.startswith(stage_a)}
         model.load_state_dict(shared, strict=False)
-    model.attach(s.network, s.network.edges, s.gauges.reach, device, s.dams)
-    gpu = Device(s.network, s.gauges, arrays, device, s.dams)
+    model.attach(s.network, s.network.edges, s.gauges.reach, device)
+    gpu = Device(s.network, s.gauges, arrays, device)
     ddp = DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True) if world > 1 else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     per_rank = a.updates * a.accumulate
@@ -323,7 +291,7 @@ def train(a, rank, world, device):
     withheld = torch.as_tensor(withheld_gauges(a.fold), device=device)
     trained = torch.as_tensor(s.gauges.trained, device=device) & ~withheld
     best, began, log = -math.inf, time.perf_counter(), []
-    running = np.zeros(5)
+    running = np.zeros(4)
     iterator = iter(loader)
     for update in range(1, a.updates + 1):
         lr = a.lr * min(1.0, update / a.warmup) * 0.5 * (1 + math.cos(math.pi * update / a.updates))
@@ -335,13 +303,9 @@ def train(a, rank, world, device):
             context = ddp.no_sync() if (world > 1 and not sync) else torch.enable_grad()
             with context, torch.autocast("cuda", torch.bfloat16):
                 outputs = ddp(b)
-                free = 1 - b["regulated"]  # NWM does not know TVA's releases
-                released, arrived = dam_loss(outputs["release"], outputs["inflow"], b)
-                dams = released + 0.5 * arrived
                 if a.stage == "A":
-                    prior = nwm_loss(outputs["sim"], b, arrays, slice(None), rows=free)
-                    loss = prior + dams
-                    parts = (0.0, prior.item(), dams.item(), 0.0)
+                    loss = nwm_loss(outputs["sim"], b, arrays, slice(None))
+                    parts = (0.0, loss.item(), 0.0)
                 else:
                     # The simulation head follows NWM everywhere. The observed head, which
                     # forecasts ungauged reaches, follows NWM fully outside the basins of
@@ -349,8 +313,8 @@ def train(a, rank, world, device):
                     inside = 1.0 - 0.9 * b["owned"]
                     everything = slice(None)
                     prior = 0.5 * (
-                        nwm_loss(outputs["sim"], b, arrays, everything, rows=free)
-                        + nwm_loss(outputs["observed"], b, arrays, everything, rows=inside * free)
+                        nwm_loss(outputs["sim"], b, arrays, everything)
+                        + nwm_loss(outputs["observed"], b, arrays, everything, rows=inside)
                     )
                     # Gauges: the forecast (gauge head where visible) and the routed observed
                     # head (the ungauged forecast) at every training gauge.
@@ -358,8 +322,8 @@ def train(a, rank, world, device):
                     routed, _ = gauge_loss(outputs["routed_gauge"], outputs["sigma"], b, trained)
                     observed = 0.5 * (observed + routed)
                     stay = outputs["delta"].pow(2).mean()
-                    loss = observed + a.nwm_weight * prior + a.dam_weight * dams + 0.1 * spread + a.delta_weight * stay
-                    parts = (observed.item(), prior.item(), dams.item(), spread.item())
+                    loss = observed + a.nwm_weight * prior + 0.1 * spread + a.delta_weight * stay
+                    parts = (observed.item(), prior.item(), spread.item())
                 (loss / a.accumulate).backward()
             running += np.array([loss.item(), *parts])
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -370,7 +334,7 @@ def train(a, rank, world, device):
             running[:] = 0
             minutes = (time.perf_counter() - began) / 60
             print(
-                f"update {update}/{a.updates} loss {r[0]:.4f} (obs {r[1]:.4f} nwm {r[2]:.4f} dams {r[3]:.4f} spread {r[4]:.4f}) "
+                f"update {update}/{a.updates} loss {r[0]:.4f} (obs {r[1]:.4f} nwm {r[2]:.4f} spread {r[3]:.4f}) "
                 f"lr {lr:.2e} {minutes:.1f} min",
                 flush=True,
             )

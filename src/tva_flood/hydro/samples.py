@@ -9,17 +9,14 @@ A sample at issue step t holds, from t - ``HISTORY`` to t + ``HORIZON``:
   gauges show before t and which gives the targets after t;
 - NWM retrospective flow over the scored window [t-32, t+40) (normalized log, validity);
 - which gauges are visible and the visible gauge owning each reach (smallest visible
-  basin containing it); antecedent storage at the issue day; season of every step;
-- at every TVA dam the observed release and inflow [T, dam] (the model reads them only
-  before t; after t they are targets), the storage change over the last 30 and 90 days,
-  and TVA's forecast release issued at t, where one exists (``plan``).
+  basin containing it); antecedent storage at the issue day; season of every step.
 """
 
 import numpy as np
 import torch
 
 from . import paths as P
-from .data import PRECIP, Antecedent, Arrays, Dams, Gauges, Network, Rain
+from .data import PRECIP, Antecedent, Arrays, Gauges, Network, Rain
 
 
 class Samples:
@@ -27,7 +24,6 @@ class Samples:
         self.arrays = Arrays()
         self.network = network or Network()
         self.gauges = Gauges(self.network, self.arrays.times)
-        self.dams = Dams(self.network, self.arrays.times)
         self.antecedent = Antecedent()
         self.rain = Rain()
         day = self.arrays.times.dayofyear.to_numpy() + self.arrays.times.hour.to_numpy() / 24
@@ -65,10 +61,6 @@ class Samples:
             nwm_valid=a.read("flow_valid", window.start, window.stop),
             antecedent=self.antecedent.at(step),
             season=self.season[:, start:stop],
-            release=self.dams.release[start:stop],
-            dam_inflow=self.dams.inflow[start:stop],
-            storage=self.dams.storage(step),
-            plan=self.dams.planned(step),
             **self.gauge_view(step, visible, withheld),
         )
 
@@ -88,7 +80,7 @@ class Samples:
 class Device:
     """Fixed network tensors on the device; samples become model inputs there."""
 
-    def __init__(self, network, gauges, arrays, device, dams):
+    def __init__(self, network, gauges, arrays, device):
         self.device = device
         self.flow_mean, self.flow_std = float(arrays.mean[8]), float(arrays.std[8])
         self.rain_mean, self.rain_std = float(arrays.mean[PRECIP]), float(arrays.std[PRECIP])
@@ -106,11 +98,6 @@ class Device:
             # forecast near zero still feels the full pull of the target.
             eps=torch.as_tensor(np.maximum(0.01 * network.mean_raw, 1e-4), device=device),
             gauge_eps=torch.as_tensor(np.maximum(0.01 * gauges.mean_raw, 1e-4), device=device),
-            regulated=torch.as_tensor(dams.regulated, device=device),
-            dam_reach=torch.as_tensor(dams.reach, device=device),
-            dam_mean_raw=torch.as_tensor(dams.mean_raw, device=device),
-            dam_std_raw=torch.as_tensor(dams.std_raw, device=device),
-            dam_eps=torch.as_tensor(np.maximum(0.01 * dams.mean_raw, 1e-3), device=device),
         )
 
     def batch(self, s):
@@ -118,8 +105,7 @@ class Device:
         b = dict(self.fixed)
         b["weather"] = move(s["weather"]).permute(1, 0, 2).float()  # [reach, step, 8]
         b["valid"] = move(s["valid"]).permute(1, 0, 2).float()
-        for key in ("season", "antecedent", "nwm", "nwm_valid", "observed", "visible", "owner",
-                    "release", "dam_inflow", "storage", "plan"):
+        for key in ("season", "antecedent", "nwm", "nwm_valid", "observed", "visible", "owner"):
             b[key] = move(s[key])
         return self.assemble(b)
 

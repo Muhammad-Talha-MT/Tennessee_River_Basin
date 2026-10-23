@@ -1,72 +1,74 @@
-# Regulated graph-routing forecast model (`tva_flood.hydro`, V3)
+# Graph-routing forecast model (`tva_flood.hydro`)
 
-One model, one training recipe, four tests: forecasts at gauges with their recent flow,
-at gauges whose flow the model never saw, at all 58,834 reaches, and at the TVA dams.
+One model, one training recipe, three tests: forecasts at gauges with their recent flow,
+at gauges whose flow the model never saw, and at all 58,834 reaches.
 
 ## The forecast rule (every model, training and test)
 
-At a 00Z issue a model sees what a forecaster has: observed AORC weather, observed USGS
-flow and the TVA dams' observed releases and inflows before the issue, and after it only
-the GEFSv12 control rain forecast to 240 h; every other future variable is unknown.
-Training uses the GEFSv12 reforecast (issues 2000-2018, targets ending before 2019),
-selection 2019 the same way, and the test the operational GEFSv12 (from 2020-09-23).
-Realized rain appears only in `+aorc` rows of the evaluation, as a perfect-rain diagnostic.
-On the TVA-plan track the reservoir module also reads TVA's forecast release in force at
-the issue (issued at or before it).
+At a 00Z issue a model sees what a forecaster has: observed AORC weather and observed USGS
+flow before the issue, and after it only the GEFSv12 control rain forecast to 240 h; every
+other future variable is unknown. Training uses the GEFSv12 reforecast (issues 2000-2018,
+targets ending before 2019), selection 2019 the same way, and the test the operational
+GEFSv12 (from 2020-09-23, the first day it exists). The new model, V2 (from scratch) and
+the tuned LSTM all follow it (`scripts/gefs_pipeline.sh`). Realized rain appears only in
+`+aorc` rows of the evaluation, as a perfect-rain diagnostic.
 
-## The dams (`hydro.dams`, `processed/hydro/dams.npz`)
-
-TVA's archive of 44 dams: 42 are on the graph (Barkley and Great Falls are on the
-Cumberland). Six-hour observed releases (1976-2026) and inflows (computed by TVA from
-releases and storage changes), and TVA's forecasts of both (32 dams, from 2016-10).
-Timestamps are UTC (release changes match USGS gauges just below two dams at lag 0). Each
-dam sits at the reach that ends at the dam and carries its water (mean NWM flow within a
-factor 2 of the mean release); four reaches are fixed by hand, with the reasons in the
-module. For every reach the file holds the first dam on its way down and the share of its
-basin whose water passes a dam first (2,405 reaches have more than half).
-
-## Model (`model.RegulatedModel`)
+## Model
 
 | Part | What it does | Why |
 |---|---|---|
-| Inputs | Per reach and step: weather (in the future only forecast rain), season, 30 days of observed flow at a visible gauge's reach, the owning gauge's specific discharge across its basin. Per reach: 48 static inputs, 7 antecedent-storage features, area ratio to the owning gauge | Gauge state enters directly; a basin sees what its gauge is doing |
+| Inputs | Per reach and step: weather (8 AORC variables + validity; in the future only forecast rain), season, 30 days of observed flow at a visible gauge's reach, and the owning gauge's specific discharge at every reach of its basin. Per reach: 48 static inputs, 7 antecedent-storage features, area ratio to the owning gauge | Gauge state enters directly (short leads); a whole basin sees what its gauge is doing (ungauged reaches) |
 | LSTM, per reach | 128 units over 36 days of history and the 10-day forecast window | Runoff memory and timing |
-| Basin pooling | Area-weighted means of each reach's state over its whole upstream basin in near, middle and far river-distance bands, then 2 local graph layers (upstream and downstream neighbours) | What the basin above is doing, beyond a few hops |
-| Simulation head | Lateral inflow q >= 0, routed along the natural river | The NWM prior (off the dams' reach) |
-| Observed head | q x exp(delta), delta bounded and kept small | Corrects runoff where gauges disagree |
-| Routing, split at dams | Q_i(t) = sum over upstream j not behind a dam above i of f_ij (h_g * q_j)(t) + releases of the dams above i (to the next dam), with one release kernel per distance bin; 27 runoff kernels (distance x lakes), each summing to one | Mass is conserved; below a dam the river carries what TVA releases |
-| Reservoir module | Per dam: a GRU over 20 days of release, observed and routed inflow, with the storage change over 30 and 90 days; a decoder over the leads reading the routed inflow forecast, season and (plan track) TVA's planned release. Dams above first | Releases are operators' decisions: learned from 40 years of them |
-| Gauge head | At visible gauges: the LSTM's inputs (30 days of flow, basin-mean weather and attributes, basin-mean forecast rain) plus the routed and simulated flow; output = routed flow x exp(correction) | It sees everything the LSTM sees, and the river network besides |
-| Corrections | A visible gauge's correction (observed or forecast minus routed) carried down its main path to the next visible gauge or dam | Downstream reaches benefit from a gauge |
-| Spread | Log-flow standard deviation at gauges | Probabilistic scores |
+| Graph layers | 3 blocks mixing each reach's state with the mean state of its upstream and downstream neighbours at every step (32 channels) | Neighbours and nearby gauges share information |
+| Simulation head | Lateral inflow q >= 0 = runoff depth x local catchment area, routed | Trained to the NWM v3.0 retrospective at every reach (the prior) |
+| Observed head | q x exp(delta), delta time-varying from the graph states, kept small by a penalty | Trained on gauges: corrects NWM-like flow where observations disagree, stays close to it elsewhere |
+| Routing | Q_i(t) = sum over upstream j of f_ij (h_g * q_j)(t); 27 kernels (river distance x lake reaches on the path), each summing to one, 12 days long | Mass is conserved: headwaters cannot add up to more than the river below them; main stems are trained like any reach |
+| Gauge head | At visible gauges: an LSTM over 30 days of observed flow and 8 days of routed flow, a decoder over the 40 leads (routed forecasts, basin-mean forecast rain, lead, gauge descriptors); output = routed flow x exp(carried misfit + learned correction) | Uses the gauge's own history at every lead |
+| Spread | Log-flow standard deviation at gauges | Probabilistic flood scores |
 
-## Training (`hydro.train`)
+Antecedent storage (`processed/hydro/antecedent.npy`): exponentially weighted rain over
+7, 30, 90, 180 and 365 days and temperature over 30 and 90 days, per reach and day.
 
-| Stage | Inputs | Loss |
-|---|---|---|
-| A | Forecast samples, no gauges | Simulation head vs NWM retrospective, bounded NSE per reach, weighted by the share of the basin not behind a dam; forecast releases vs observed; reservoir inflow vs TVA's (daily means) |
-| B | Trunk, simulation head, routing and reservoirs from A. A random half of the eligible gauges visible (none in 15%) | Gauge head and routed head (with corrections) at every training gauge, flows above the 90th percentile x3 + 0.3 NWM prior (a tenth inside visible gauges' basins) + 0.5 dams + 0.1 spread + 0.01 delta squared |
+## Training
 
-A fold (`--fold k`) withholds its gauges from targets, inputs and selection (dams never).
-Stage B selects on 2019: the mean of median NSE at gauges with history shown, hidden,
-against NWM at every reach, and of the forecast releases, over leads 24-120 h.
+| Stage | Inputs | Loss | Purpose |
+|---|---|---|---|
+| A, pre-training | Forecast samples (the rule above); no gauges | Simulation head vs NWM retrospective at every reach over 8 days before and 10 days after the issue: bounded per-reach NSE, log(1 + MSE/variance), on flow and log flow | Runoff, graph mixing and routing everywhere, main stems included |
+| B, forecast | Trunk, simulation head and routing from A; other heads fresh. A random half of the eligible gauges visible (none in 15% of samples) | Gauge head and routed observed head at every training gauge, shown or not (bounded per-gauge NSE, x3 above the gauge's 90th percentile) + 0.3 x NWM prior (simulation head everywhere; observed head at a tenth inside visible gauges' basins) + 0.1 x spread + 0.01 x mean delta squared | One model for gauged and ungauged use; NWM keeps ungauged reaches in place, gauges win in their basins |
+
+A fold (`--fold k`, five folds of CAMELS-H gauges, `data.folds`) withholds its gauges
+from targets, inputs and selection. Stage B selects on 2019: the mean of median NSE at
+training gauges with history shown, with history hidden, and against the NWM
+retrospective at every reach, over leads 24-120 h.
 
 ## Commands
 
 ```bash
-python -m tva_flood hydro-prepare     # processed/hydro: routing, reach statistics, antecedent storage (once)
-python -m tva_flood hydro-dams        # processed/hydro/dams.npz and dams.csv (once)
-setsid -f nohup bash scripts/v3_pipeline.sh </dev/null >>/data/tva_data/logs/v3_pipeline.log 2>&1
+python -m tva_flood.hydro.prepare --workers 24   # processed/hydro (CPU, ~5 min; once)
+setsid -f nohup bash scripts/gefs_pipeline.sh </dev/null >>/data/tva_data/logs/gefs_pipeline.log 2>&1
 ```
 
-The pipeline trains `models/v3_A`, `v3_B` and `v3_B_f1..5` and writes `models/v3_evaluation/report.md`: gauged, ungauged, every reach
-(with the NWM forecast and the LSTM run at every reach, `scripts/lstm_every_reach.py`) and
-the dams (against TVA's forecasts and persistence), split by regulation.
+The pipeline trains the new model (`models/gefs_hydro_A`, `gefs_hydro_B`, folds
+`gefs_hydro_B_f1..5`), V2 (`gefs_v2*`) and the LSTM (`gefs_lstm*`), scores V2 and the
+LSTM at the gauges (`gefs_benchmark*`) and V2 and NWM at every reach
+(`retrospective_comparison_gefs_*`), then `tva_flood.hydro.evaluate` writes the three
+protocols for all of them on the same issues, gauges and masks
+(`models/gefs_evaluation/report.md`).
 
-A third stage, training the gauge head further on a frozen stage-B model with cached
-inputs (`hydro.head`), was tried and dropped: on unseen years (2017-2018 and 2019) the head
-got worse by its own loss and by NSE, at every learning rate tried. Stage B already shows
-the head about a million (issue, gauge) examples; more passes only overfit.
+The evaluation also splits results by the TVA dams (`python -m tva_flood hydro-dams`,
+`processed/hydro/dams.npz`), which the model never reads: gauges in headwater basins
+without a dam, below another gauge without a dam, and with a dam in the basin; reaches
+with more than half their basin behind a dam.
 
-Earlier models stay loadable for evaluation: `HydroModel` (GEFS-rule run, `models/gefs_*`)
-and V1 (`legacy.HydroModelV1`, `--legacy --rain-steps 16`).
+## Tried and set aside
+
+V3 (git tag `v3-snapshot`; `models/v3_*`, `models/v3_evaluation/report.md`) added a
+reservoir module trained on TVA's releases, routing split at the dams, basin pooling and
+gauge corrections carried downstream. It tied this model at the gauges and on ungauged
+gauges and lost on larger rivers against the NWM retrospective; the dam split helped only
+at regulated gauges at 24 h.
+
+## Not yet included
+
+Gauges in neighbouring regions, karst and lithology attributes, GEFS ensemble members
+(only the control member is downloaded) and HRRR short-range rain need new downloads.

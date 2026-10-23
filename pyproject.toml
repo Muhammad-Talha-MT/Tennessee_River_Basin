@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tva-flood"
+version = "0.1.0"
+description = "Tennessee full-network river forecasting data and training pipeline"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24,<3", "pandas>=2,<3", "xarray>=2024.1", "netCDF4>=1.6", "pyarrow>=14", "scipy>=1.10", "torch>=2.7,<3", "tqdm>=4.66"]
+
+[project.optional-dependencies]
+download = ["geopandas>=0.14", "shapely>=2", "pyogrio>=0.7", "s3fs>=2024.2", "zarr>=2.16,<3", "py7zr>=0.20", "remotezip>=0.12"]
+dev = ["pytest>=8", "ruff>=0.9"]
+
+[project.scripts]
+tva-flood = "tva_flood.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

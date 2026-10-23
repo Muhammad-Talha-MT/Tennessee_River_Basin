@@ -286,6 +286,22 @@ class HydroModel(nn.Module):
         share = np.bincount(position[rows[keep]], weights=mass * lake, minlength=g)
         self.lake_share = torch.as_tensor(share, dtype=torch.float32, device=device)
 
+    def gauge_rain(self, b):
+        """Basin-mean forecast rain and whether it is known at every gauge [G, lead, 2]."""
+        future = slice(P.HISTORY, P.WINDOW)
+        rain = torch.stack([b["weather"][:, future, 0], b["valid"][:, future, 0]], dim=-1).float()
+        return SparseProduct.apply(*self.basin_mean, rain.reshape(rain.shape[0], -1)).view(-1, P.HORIZON, 2)
+
+    def gauge_weather(self, b):
+        """Basin-mean weather and validity over the last 30 days at every gauge [G, 120, 16] (the LSTM's inputs)."""
+        past = slice(P.HISTORY - 120, P.HISTORY)
+        weather = torch.cat([b["weather"][:, past], b["valid"][:, past]], dim=-1).float()
+        return SparseProduct.apply(*self.basin_mean, weather.reshape(weather.shape[0], -1)).view(-1, 120, 16)
+
+    def gauge_describe(self, b):
+        """Gauge descriptors [G, 50]: attributes at the gauge reach, log basin area, share of the basin behind lakes."""
+        return torch.cat([b["static"][b["gauge_reach"]], torch.log(b["gauge_area"])[:, None] / 10, self.lake_share[:, None]], dim=-1)
+
     def forward(self, b, full=False):
         """Outputs over the scored window [t-32, t+40) (``paths.SCORED`` steps).
 
@@ -309,12 +325,8 @@ class HydroModel(nn.Module):
         if visible.any():
             shown = torch.nonzero(visible)[:, 0]
             lead = slice(P.INNOVATION, P.SCORED)
-            future = slice(P.HISTORY, P.WINDOW)
-            rain = torch.stack([b["weather"][:, future, 0], b["valid"][:, future, 0]], dim=-1).float()
-            basin = SparseProduct.apply(*self.basin_mean, rain.reshape(rain.shape[0], -1)).view(-1, P.HORIZON, 2)
-            describe = torch.cat(
-                [b["static"][reach], torch.log(b["gauge_area"])[:, None] / 10, self.lake_share[:, None]], dim=-1
-            )
+            basin = self.gauge_rain(b)
+            describe = self.gauge_describe(b)
             correction = self.head(
                 b["observed"][P.HISTORY - 120 : P.HISTORY, shown].T,
                 routed[shown],

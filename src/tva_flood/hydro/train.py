@@ -21,7 +21,9 @@ With ``--loss nse-q`` the gauge terms change (stage A, the NWM prior and the sel
 loss = NSE* of the forecasts (gauge head and routed observed head; squared error over the squared
 (gauge flow std + 0.1 m3/s), Kratzert et al. 2019, no log terms, no flood weight) + the pinball
 loss of a tail head (0.5, 0.9 and 0.99 flow quantiles around the detached forecast, same scale)
-+ 0.3 x NWM prior [+ delta weight x correction penalty]; no spread term.
++ 0.3 x NWM prior [+ delta weight x correction penalty]; no spread term. ``--head lstm`` gives the gauge head
+256 units, the LSTM baseline's log-flow scaling and its inputs (30 days of basin-mean weather and the 48
+basin-mean attributes at every step), trained jointly with the rest.
 A fold (``--fold k``) withholds that fold's gauges from everything: targets, inputs and
 model selection.
 
@@ -292,6 +294,7 @@ def main():
     p.add_argument("--delta-weight", type=float, default=0.01, help="Observed-head penalty")
     p.add_argument("--loss", choices=["bounded", "nse-q"], default="bounded", help="Stage B gauge loss (see the module docstring)")
     p.add_argument("--tail-weight", type=float, default=1.0, help="nse-q: weight of the pinball loss")
+    p.add_argument("--head", choices=["small", "lstm"], default="small", help="Gauge head: 64 units, log1p/5 inputs; or 256 units with the LSTM's scaling and inputs")
     p.add_argument("--validate-every", type=int, default=1000)
     p.add_argument("--workers", type=int, default=5)
     p.add_argument("--seed", type=int, default=1)
@@ -316,7 +319,10 @@ def train(a, rank, world, device):
         atomic_json(out / "arguments.json", {k: str(v) for k, v in vars(a).items()})
     s = samples()
     arrays = s.arrays
-    model = HydroModel(s.network.groups, s.network.delay, hidden=a.hidden, quantiles=a.loss == "nse-q").to(device)
+    head = None
+    if a.head == "lstm":  # 256 units, the LSTM baseline's log-flow scaling and its inputs (basin weather and attributes)
+        head = dict(hidden=256, scale="z", lstm_inputs=True, flow_mean=float(arrays.mean[8]), flow_std=float(arrays.std[8]))
+    model = HydroModel(s.network.groups, s.network.delay, hidden=a.hidden, quantiles=a.loss == "nse-q", head=head).to(device)
     if a.init:  # stage A trains runoff and routing only; every head starts fresh
         state = torch.load(a.init, map_location="cpu", weights_only=False)
         if a.whole:

@@ -235,6 +235,7 @@ def main():
     p.add_argument("--stage", choices=["A", "B"], required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--init", type=Path, help="Stage B: stage-A checkpoint")
+    p.add_argument("--whole", action="store_true", help="Load every part of --init (continue a stage-B model)")
     p.add_argument("--fold", type=int, default=0, help="Withhold this fold's gauges (1-5)")
     p.add_argument("--updates", type=int, default=6000)
     p.add_argument("--accumulate", type=int, default=2)
@@ -270,9 +271,11 @@ def train(a, rank, world, device):
     model = HydroModel(s.network.groups, s.network.delay, hidden=a.hidden).to(device)
     if a.init:  # stage A trains runoff and routing only; every head starts fresh
         state = torch.load(a.init, map_location="cpu", weights_only=False)
-        stage_a = ("trunk.", "simulation.", "router.")  # what stage A trains; heads start fresh
-        shared = {k: v for k, v in state["model"].items() if k.startswith(stage_a)}
-        model.load_state_dict(shared, strict=False)
+        if a.whole:
+            model.load_state_dict(state["model"])
+        else:
+            stage_a = ("trunk.", "simulation.", "router.")  # what stage A trains; heads start fresh
+            model.load_state_dict({k: v for k, v in state["model"].items() if k.startswith(stage_a)}, strict=False)
     model.attach(s.network, s.network.edges, s.gauges.reach, device)
     gpu = Device(s.network, s.gauges, arrays, device)
     ddp = DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True) if world > 1 else model

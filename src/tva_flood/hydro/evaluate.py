@@ -56,6 +56,7 @@ DAYS_1_5 = (24, 48, 72, 96, 120)
 FOLDS = 5
 BASELINES = (("LSTM, tuned", "lstm"),)
 AREA_CLASSES = (("< 50 km2", 0, 50), ("50-500", 50, 500), ("500-5,000", 500, 5000), ("> 5,000", 5000, np.inf))
+METRICS = ("nse", "kge", "r", "alpha", "beta", "rmse", "peak_error", "peak_error_at_target_time")  # saved per reach
 
 
 def load_model(path, s, device, legacy=False):
@@ -488,7 +489,12 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     table, rows = reach_table(series, reach_fold, network, regulated)
     table.to_csv(out / "reaches.csv", index=False)
     lines += ["", f"## 3. Every reach against the NWM v3.0 retrospective ({len(every_reach)} issues to 2023-01-20)", ""] + rows
-    np.savez_compressed(out / "reach_metrics.npz", comid=network.ids, reach_fold=reach_fold, **{f"{k}/nse": v for k, v in series.items()})
+    full = {f"{a.label}+{t}/{k}": metrics[f"hydro+{t}"][k] for t in ("gefs", "aorc") for k in METRICS}
+    if lstm.exists():
+        full.update({f"LSTM, tuned+{t}/{k}": saved[f"{k}/{t}"] for t in ("gefs", "aorc") for k in METRICS if f"{k}/{t}" in saved})
+    full.update({f"NWM forecast/{k}": nwm_ref[f"reach/nwm_forecast/{k}"] for k in METRICS if f"reach/nwm_forecast/{k}" in nwm_ref})
+    full.update({f"{k}/nse": v for k, v in series.items()})
+    np.savez_compressed(out / "reach_metrics.npz", comid=network.ids, reach_fold=reach_fold, **full)
     lines += ["", "Median NSE per lead (six-hour means). Days 1-5: mean of the medians at 24-120 h."]
     report = "\n".join(lines) + "\n"
     (out / "report.md").write_text(report)

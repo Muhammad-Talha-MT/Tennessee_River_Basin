@@ -13,7 +13,8 @@ own, so the flow history is hidden everywhere (the LSTM was trained with 10% hid
 at the few gauge reaches of the all-gauge model that the new model sees.
 
   torchrun --standalone --nproc_per_node 4 scripts/lstm_every_reach.py
-Output: models/gefs_lstm_reaches/metrics.npz (nse/gefs, nse/aorc [lead, reach], issues).
+Output: models/gefs_lstm_reaches/metrics.npz ({metric}/gefs, {metric}/aorc [lead, reach] for
+NSE, KGE and its parts, RMSE and peak errors; issues).
 """
 
 import argparse
@@ -29,7 +30,7 @@ import torch.distributed as dist
 from tva_flood.evaluation.benchmark import load_nwm
 from tva_flood.evaluation.hydrology import Accumulator, reach_metrics
 from tva_flood.hydro import paths as P
-from tva_flood.hydro.evaluate import FOLDS, FUTURE, NWMReaches, reach_folds, test_issues
+from tva_flood.hydro.evaluate import FOLDS, FUTURE, METRICS, NWMReaches, reach_folds, test_issues
 from tva_flood.hydro.samples import Samples
 from tva_flood.models.lstm import ForecastLSTM
 from tva_flood.training.forecast import MAX_LOG_FLOW
@@ -173,9 +174,10 @@ def run(a, rank, world, device):
         accumulator.reduce(world)
     if rank == 0:
         a.out.mkdir(parents=True, exist_ok=True)
-        nse = {t: reach_metrics(**acc[t].numpy(), min_count=a.min_count)["nse"] for t in tags}
+        metrics = {t: reach_metrics(**acc[t].numpy(), min_count=a.min_count) for t in tags}
         if not a.limit:
-            np.savez_compressed(a.out / "metrics.npz", comid=network.ids, issues=len(every_reach), **{f"nse/{t}": v for t, v in nse.items()})
+            np.savez_compressed(a.out / "metrics.npz", comid=network.ids, issues=len(every_reach),
+                                **{f"{k}/{t}": m[k] for t, m in metrics.items() for k in METRICS})
         print(f"LSTM every reach COMPLETE: {a.out} ({len(every_reach)} issues)", flush=True)
 
 

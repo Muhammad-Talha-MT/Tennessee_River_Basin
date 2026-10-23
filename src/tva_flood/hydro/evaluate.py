@@ -62,7 +62,7 @@ METRICS = ("nse", "kge", "r", "alpha", "beta", "rmse", "peak_error", "peak_error
 def load_model(path, s, device, legacy=False):
     state = torch.load(path, map_location="cpu", weights_only=False)
     c = state["config"]
-    model = (HydroModelV1 if legacy else HydroModel)(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **({"quantiles": True} if c.get("quantiles") else {}))
+    model = (HydroModelV1 if legacy else HydroModel)(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **{k: c[k] for k in ("quantiles", "head") if k in c})
     model.load_state_dict(state["model"])
     model.to(device).eval()
     model.attach(s.network, s.network.edges, s.gauges.reach, device)

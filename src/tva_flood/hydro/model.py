@@ -183,52 +183,60 @@ class Router(nn.Module):
 class GaugeHead(nn.Module):
     """Direct forecast [g, lead] at visible gauges from their history and the routed flow.
 
-    Encoder: an LSTM over the last 30 days at the gauge: observed log flow (and whether it
-    exists), and over the last 8 days the routed observed-head and simulated flow there.
-    Decoder: an LSTM over the 40 leads, started from the encoder state, reading the routed
-    forecast of both heads, the basin-mean forecast rain and a lead embedding. Gauge
-    descriptors (attributes, log basin area, share of the basin behind lakes) enter both.
-    Output: the routed observed-head flow x exp(correction), where the correction starts as
-    a learned share of the latest misfit, fading with lead, so short leads begin as
-    corrected persistence and later leads as the routed forecast.
+    Encoder: an LSTM over the last 30 days at the gauge: observed flow (and whether it
+    exists), and over the last 8 days the routed observed-head and simulated flow there; with
+    ``lstm_inputs`` also the basin-mean weather (16 channels) and the 48 basin-mean attributes
+    at every step (the LSTM baseline's inputs). Decoder: an LSTM over the 40 leads, started
+    from the encoder state, reading the routed forecast of both heads, the basin-mean forecast
+    rain, a lead embedding (and the attributes). Gauge descriptors enter the encoder's start state.
+    Output: a log correction of the routed observed-head flow, a learned share of the latest
+    misfit fading with lead (short leads begin as corrected persistence, later leads as the
+    routed forecast) plus a decoder term.
+
+    ``scale``: flows enter as log1p(flow) / 5 ("log5") or as the log flow normalized by its mean
+    and std over the training data ("z", the LSTM baseline's scaling). The defaults are the first
+    head of this model; ``hidden=256, scale="z", lstm_inputs=True`` is the one in use (see
+    ``scripts/head_settings.py``).
     """
 
-    def __init__(self, hidden=64, statics=48):
+    def __init__(self, hidden=64, statics=48, scale="log5", lstm_inputs=False, flow_mean=0.0, flow_std=1.0):
         super().__init__()
+        self.scale, self.lstm_inputs, self.flow_mean, self.flow_std = scale, lstm_inputs, flow_mean, flow_std
         self.describe = mlp(statics + 2, hidden, hidden)
-        self.encode = nn.LSTM(4, hidden, batch_first=True)
-        self.decode = nn.LSTM(4 + 16, hidden, batch_first=True)
+        self.encode = nn.LSTM(4 + (16 + 48 if lstm_inputs else 0), hidden, batch_first=True)
+        self.decode = nn.LSTM(4 + 16 + (48 if lstm_inputs else 0), hidden, batch_first=True)
         self.lead = nn.Embedding(P.HORIZON, 16)
         self.out = nn.Linear(hidden, 1)
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
         self.keep = nn.Parameter(3.0 - 0.25 * torch.arange(P.HORIZON, dtype=torch.float32))
 
+    def flow(self, x):
+        z = torch.log1p(x.clamp_min(0))
+        return z / 5 if self.scale == "log5" else (z - self.flow_mean) / self.flow_std
+
     @torch.autocast("cuda", enabled=False)
-    def forward(self, history, routed, simulated, rain, describe):
+    def forward(self, history, routed, simulated, rain, describe, weather=None, basin=None):
         """history [g, H] observed flow (NaN missing) before t; routed, simulated [g, S]
         (scored window); rain [g, lead, 2] basin-mean forecast rain and known share;
-        describe [g, statics + 2]. Returns log corrections [g, lead]."""
+        describe [g, statics + 2]; with ``lstm_inputs`` weather [g, H, 16] and basin attributes
+        [g, 48]. Returns log corrections [g, lead]."""
         g = history.shape[0]
         before = P.INNOVATION
         valid = torch.isfinite(history)
-        obs = torch.where(valid, torch.log1p(torch.nan_to_num(history).clamp_min(0)) / 5, 0.0)
+        obs = torch.where(valid, self.flow(torch.nan_to_num(history)), 0.0)
         tail = torch.zeros(g, history.shape[1], 2, device=history.device)
-        tail[:, -before:, 0] = torch.log1p(routed[:, :before]) / 5
-        tail[:, -before:, 1] = torch.log1p(simulated[:, :before]) / 5
-        state = self.describe(describe.float())
-        h0 = state[None].contiguous()
-        _, (h, c) = self.encode(torch.cat([obs[..., None], valid[..., None].float(), tail], dim=-1), (h0, torch.zeros_like(h0)))
-        future = torch.cat(
-            [
-                torch.log1p(routed[:, before:])[..., None] / 5,
-                torch.log1p(simulated[:, before:])[..., None] / 5,
-                rain.float(),
-                self.lead.weight[None].expand(g, -1, -1),
-            ],
-            dim=-1,
-        )
-        decoded, _ = self.decode(future, (h, c))
+        tail[:, -before:, 0] = self.flow(routed[:, :before])
+        tail[:, -before:, 1] = self.flow(simulated[:, :before])
+        steps = [obs[..., None], valid[..., None].float(), tail]
+        future = [self.flow(routed[:, before:])[..., None], self.flow(simulated[:, before:])[..., None], rain.float(),
+                  self.lead.weight[None].expand(g, -1, -1)]
+        if self.lstm_inputs:
+            steps += [weather.float(), basin.float()[:, None].expand(-1, history.shape[1], -1)]
+            future.append(basin.float()[:, None].expand(-1, P.HORIZON, -1))
+        h0 = self.describe(describe.float())[None].contiguous()
+        _, (h, c) = self.encode(torch.cat(steps, dim=-1), (h0, torch.zeros_like(h0)))
+        decoded, _ = self.decode(torch.cat(future, dim=-1), (h, c))
         learned = 3 * torch.tanh(self.out(decoded)[..., 0])
         latest = valid[:, -1]
         misfit = torch.log(torch.nan_to_num(history[:, -1]).clamp_min(0) + EPS) - torch.log(routed[:, before - 1] + EPS)
@@ -244,7 +252,7 @@ class HydroModel(nn.Module):
     the flow at every gauge and lead, each the forecast (detached, so the tail loss never moves the
     mean) times exp of a non-decreasing offset."""
 
-    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False):
+    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False, head=None):
         super().__init__()
         self.config = dict(
             groups=groups,
@@ -255,13 +263,15 @@ class HydroModel(nn.Module):
         )
         if quantiles:
             self.config["quantiles"] = True
+        if head:
+            self.config["head"] = head  # GaugeHead settings
         self.trunk = Trunk(hidden, channels, graph_layers)
         self.simulation = nn.Linear(channels, 1)
         self.observed = nn.Linear(channels, 1)
         nn.init.zeros_(self.observed.weight)
         nn.init.zeros_(self.observed.bias)
         self.router = Router(groups, delay)
-        self.head = GaugeHead()
+        self.head = GaugeHead(**(head or {}))
         self.lead = nn.Embedding(P.HORIZON, 16)
         if quantiles:
             self.tail = mlp(48 + 16 + 4, 64, len(QUANTILES))
@@ -285,6 +295,24 @@ class HydroModel(nn.Module):
         lake = (network.group[keep] % 3) > 0  # lake or reservoir reaches on the path
         share = np.bincount(position[rows[keep]], weights=mass * lake, minlength=g)
         self.lake_share = torch.as_tensor(share, dtype=torch.float32, device=device)
+
+    def quantiles(self, static, flags, mean):
+        """Flow quantiles ``QUANTILES`` [g, lead, 3] around ``mean`` [g, lead] (the forecast, detached): the mean times exp of a
+        non-decreasing offset. ``static`` [g, 48] attributes at the gauge reach; ``flags`` [g, 3]: visible, owned, log flow
+        at the last lead."""
+        g = len(static)
+        features = torch.cat(
+            [
+                static[:, None, :].expand(-1, P.HORIZON, -1),
+                self.lead.weight[None].expand(g, -1, -1),
+                flags[:, None, :].expand(-1, P.HORIZON, -1),
+                (torch.log1p(mean) / 5)[..., None],
+            ],
+            dim=-1,
+        )
+        raw = self.tail(features).float()
+        offset = torch.cumsum(torch.cat([raw[..., :1], F.softplus(raw[..., 1:])], dim=-1), dim=-1)
+        return mean[..., None].float() * torch.exp(offset.clamp(max=6.0))
 
     def gauge_rain(self, b):
         """Basin-mean forecast rain and whether it is known at every gauge [G, lead, 2]."""
@@ -327,12 +355,16 @@ class HydroModel(nn.Module):
             lead = slice(P.INNOVATION, P.SCORED)
             basin = self.gauge_rain(b)
             describe = self.gauge_describe(b)
+            extra = {}
+            if self.head.lstm_inputs:
+                extra = dict(weather=self.gauge_weather(b)[shown], basin=SparseProduct.apply(*self.basin_mean, b["static"])[shown])
             correction = self.head(
                 b["observed"][P.HISTORY - 120 : P.HISTORY, shown].T,
                 routed[shown],
                 out["sim"][reach][shown],
                 basin[shown],
                 describe[shown],
+                **extra,
             )
             gauge = routed.clone()
             gauge[shown, lead] = routed[shown, lead] * torch.exp(correction)
@@ -340,20 +372,17 @@ class HydroModel(nn.Module):
         flags = torch.stack(
             [visible.float(), b["owned"][reach], torch.log1p(gauge[:, -1].detach()) / 5], dim=-1
         )
-        features = torch.cat(
-            [
-                b["static"][reach][:, None, :].expand(-1, P.HORIZON, -1),
-                self.lead.weight[None].expand(len(reach), -1, -1),
-                flags[:, None, :].expand(-1, P.HORIZON, -1),
-            ],
-            dim=-1,
-        )
         if hasattr(self, "tail"):
-            mean = gauge[:, P.INNOVATION :].detach()
-            raw = self.tail(torch.cat([features, torch.log1p(mean)[..., None] / 5], dim=-1)).float()
-            offset = torch.cumsum(torch.cat([raw[..., :1], F.softplus(raw[..., 1:])], dim=-1), dim=-1)
-            out["quantile"] = mean[..., None].float() * torch.exp(offset.clamp(max=6.0))
+            out["quantile"] = self.quantiles(b["static"][reach], flags, gauge[:, P.INNOVATION :].detach())
         else:
+            features = torch.cat(
+                [
+                    b["static"][reach][:, None, :].expand(-1, P.HORIZON, -1),
+                    self.lead.weight[None].expand(len(reach), -1, -1),
+                    flags[:, None, :].expand(-1, P.HORIZON, -1),
+                ],
+                dim=-1,
+            )
             out["sigma"] = F.softplus(self.spread(features)[..., 0]) + 0.02
         if full:
             everywhere = out["observed"].clone()

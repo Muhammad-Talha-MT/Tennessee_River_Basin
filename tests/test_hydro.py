@@ -73,3 +73,26 @@ def test_river_graph_averages_parents_and_children():
     x = torch.arange(5, dtype=torch.float32)[:, None]
     assert graph.upstream(x)[:, 0].tolist() == [0.0, 0.0, 0.0, 1.5, 3.0]  # 3: parents 1, 2
     assert graph.downstream(x)[:, 0].tolist() == [1.0, 3.0, 3.0, 4.0, 0.0]
+
+
+def test_nse_star_is_the_squared_error_over_the_scaled_std():
+    from tva_flood.hydro.train import nse_star
+
+    truth = torch.tensor([[1.0, 2.0, 3.0, 4.0], [10.0, 10.0, 10.0, 10.0]])
+    pred = truth + torch.tensor([[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]])
+    valid = torch.ones_like(truth, dtype=torch.bool)
+    std = torch.tensor([0.9, 1.9])  # (std + 0.1) = 1 and 2: errors 1 and 2 give 1 and 1
+    assert abs(float(nse_star(pred, truth, valid, std)) - 1.0) < 1e-6
+    assert float(nse_star(truth, truth, valid, std)) == 0.0
+
+
+def test_pinball_penalizes_a_quantile_below_the_truth_by_q_and_above_by_one_minus_q():
+    from tva_flood.hydro.train import pinball
+
+    truth = torch.full((1, 4), 10.0)
+    valid = torch.ones(1, 4, dtype=torch.bool)
+    std = torch.tensor([0.9])  # scale 1
+    below = torch.full((1, 4, 3), 8.0)  # misses by 2: loss q * 2 for q = 0.5, 0.9, 0.99
+    above = torch.full((1, 4, 3), 12.0)  # exceeds by 2: loss (1 - q) * 2
+    assert abs(float(pinball(below, truth, valid, std)) - 2 * (0.5 + 0.9 + 0.99) / 3) < 1e-5
+    assert abs(float(pinball(above, truth, valid, std)) - 2 * (0.5 + 0.1 + 0.01) / 3) < 1e-5

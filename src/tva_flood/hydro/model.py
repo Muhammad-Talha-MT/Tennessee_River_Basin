@@ -236,8 +236,15 @@ class GaugeHead(nn.Module):
         return torch.sigmoid(self.keep)[None] * misfit[:, None] + learned
 
 
+QUANTILES = (0.5, 0.9, 0.99)  # flow quantiles of the tail head (``quantiles=True``)
+
+
 class HydroModel(nn.Module):
-    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3):
+    """``quantiles=True`` replaces the spread head by a tail head: the 0.5, 0.9 and 0.99 quantiles of
+    the flow at every gauge and lead, each the forecast (detached, so the tail loss never moves the
+    mean) times exp of a non-decreasing offset."""
+
+    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False):
         super().__init__()
         self.config = dict(
             groups=groups,
@@ -246,6 +253,8 @@ class HydroModel(nn.Module):
             channels=channels,
             graph_layers=graph_layers,
         )
+        if quantiles:
+            self.config["quantiles"] = True
         self.trunk = Trunk(hidden, channels, graph_layers)
         self.simulation = nn.Linear(channels, 1)
         self.observed = nn.Linear(channels, 1)
@@ -254,7 +263,12 @@ class HydroModel(nn.Module):
         self.router = Router(groups, delay)
         self.head = GaugeHead()
         self.lead = nn.Embedding(P.HORIZON, 16)
-        self.spread = mlp(48 + 16 + 3, 64, 1)
+        if quantiles:
+            self.tail = mlp(48 + 16 + 4, 64, len(QUANTILES))
+            nn.init.zeros_(self.tail[-1].weight)
+            self.tail[-1].bias.data = torch.tensor([0.0, -0.5, -0.5])  # softplus(-0.5) = 0.47 per step up
+        else:
+            self.spread = mlp(48 + 16 + 3, 64, 1)
 
     def attach(self, network, edges, gauge_reaches, device):
         """Fixed operators of the river graph on the device (not parameters): routing, graph,
@@ -277,7 +291,8 @@ class HydroModel(nn.Module):
 
         ``sim`` [n, S]: simulation head at every reach; ``observed`` [n, S]: observed head at
         every reach; ``routed_gauge`` [G, S]: observed head at every gauge; ``gauge`` [G, S]:
-        the forecast at every gauge (visible ones from the gauge head); ``delta`` [n, F]: observed-head log correction; ``sigma`` [G, lead]; with
+        the forecast at every gauge (visible ones from the gauge head); ``delta`` [n, F]: observed-head log correction; ``sigma`` [G, lead]
+        (or, with a tail head, ``quantile`` [G, lead, 3]: flow quantiles ``QUANTILES``); with
         ``full`` also ``reach`` [n, S]: ``observed`` with the gauge rows of ``gauge``.
         """
         scored = slice(P.FLOW_STEPS - P.SCORED, P.FLOW_STEPS)
@@ -321,7 +336,13 @@ class HydroModel(nn.Module):
             ],
             dim=-1,
         )
-        out["sigma"] = F.softplus(self.spread(features)[..., 0]) + 0.02
+        if hasattr(self, "tail"):
+            mean = gauge[:, P.INNOVATION :].detach()
+            raw = self.tail(torch.cat([features, torch.log1p(mean)[..., None] / 5], dim=-1)).float()
+            offset = torch.cumsum(torch.cat([raw[..., :1], F.softplus(raw[..., 1:])], dim=-1), dim=-1)
+            out["quantile"] = mean[..., None].float() * torch.exp(offset.clamp(max=6.0))
+        else:
+            out["sigma"] = F.softplus(self.spread(features)[..., 0]) + 0.02
         if full:
             everywhere = out["observed"].clone()
             everywhere[reach] = gauge

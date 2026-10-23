@@ -17,6 +17,11 @@ the gauged and the ungauged case. Loss = gauge forecasts (gauge head and routed 
 head; leads 1-40, flows above the gauge's 90th percentile x3) + 0.3 x NWM prior over the
 scored window (simulation head everywhere; observed head at a tenth inside visible gauges'
 basins) + 0.1 x spread + 0.01 x mean squared observed-head correction.
+With ``--loss nse-q`` the gauge terms change (stage A, the NWM prior and the selection do not):
+loss = NSE* of the forecasts (gauge head and routed observed head; squared error over the squared
+(gauge flow std + 0.1 m3/s), Kratzert et al. 2019, no log terms, no flood weight) + the pinball
+loss of a tail head (0.5, 0.9 and 0.99 flow quantiles around the detached forecast, same scale)
++ 0.3 x NWM prior [+ delta weight x correction penalty]; no spread term.
 A fold (``--fold k``) withholds that fold's gauges from everything: targets, inputs and
 model selection.
 
@@ -49,7 +54,7 @@ from tva_flood.training.runtime import save_atomic
 
 from . import paths as P
 from .data import timeline_index
-from .model import HydroModel
+from .model import QUANTILES, HydroModel
 from .samples import Device, Samples
 
 DAYS_1_5 = [3, 7, 11, 15, 19]  # lead indices of 24, 48, 72, 96, 120 h
@@ -161,6 +166,38 @@ def gauge_loss(gauge, sigma, b, use):
     return loss, spread
 
 
+def nse_star(pred, truth, valid, std, eps=0.1):
+    """Mean over gauges of the mean squared error scaled by (std + eps)^2: the NSE* loss of
+    Kratzert et al. (2019). Gauges need a quarter of their steps valid."""
+    n = valid.float().sum(dim=1)
+    mse = (((pred.float() - truth) ** 2) * valid).sum(dim=1) / n.clamp_min(1)
+    per_row = mse / (std + eps) ** 2
+    has = n >= max(1, pred.shape[1] // 4)
+    return per_row[has].mean() if has.any() else pred.sum() * 0
+
+
+def pinball(quantile, truth, valid, std, eps=0.1):
+    """Mean pinball loss of the flow quantiles [gauge, step, Q] (``model.QUANTILES``), scaled as NSE*."""
+    q = torch.tensor(QUANTILES, device=truth.device)
+    miss = truth[..., None] - quantile.float()
+    loss = torch.maximum(q * miss, (q - 1) * miss).mean(dim=-1) / (std + eps)[:, None]
+    n = valid.float().sum(dim=1)
+    per_row = (loss * valid).sum(dim=1) / n.clamp_min(1)
+    has = n >= max(1, truth.shape[1] // 4)
+    return per_row[has].mean() if has.any() else quantile.sum() * 0
+
+
+def tail_loss(out, b, use):
+    """NSE* of the forecasts at gauges ``use`` [G] (gauge head and routed observed head) and the pinball
+    loss of the tail head."""
+    observed = b["observed"][LEADS].T
+    valid = torch.isfinite(observed) & use[:, None]
+    truth = torch.nan_to_num(observed)
+    std = b["gauge_std_raw"]
+    forecast = 0.5 * (nse_star(out["gauge"][:, FUTURE], truth, valid, std) + nse_star(out["routed_gauge"][:, FUTURE], truth, valid, std))
+    return forecast, pinball(out["quantile"], truth, valid, std)
+
+
 class Sums:
     """Additive NSE statistics [rows, lead] (count, sum o, sum o2, sum e2)."""
 
@@ -206,6 +243,7 @@ def validate(model, gpu, stage, fold, rank, world, arrays):
             hidden = Sums(s.gauges.count, P.HORIZON, gpu.device)
             reaches = Sums(s.network.n, 3, gpu.device)
             use = torch.as_tensor(trained, device=gpu.device)
+            below = torch.zeros(len(QUANTILES) + 1, dtype=torch.float64, device=gpu.device)  # share of truth under each quantile
             for step in entries:
                 shown = s.eligible(step, withheld)
                 for sums, visible in ((gauged, shown), (hidden, None)):
@@ -215,6 +253,9 @@ def validate(model, gpu, stage, fold, rank, world, arrays):
                     observed = b["observed"][LEADS].T
                     valid = torch.isfinite(observed) & use[:, None]
                     sums.add(out["gauge"][:, FUTURE], observed, valid)
+                    if sums is gauged and "quantile" in out:
+                        under = (torch.nan_to_num(observed)[..., None] <= out["quantile"].float()) & valid[..., None]
+                        below += torch.cat([under.sum((0, 1)), valid.sum()[None]]).double()
                     if sums is gauged:
                         z = b["nwm"][FUTURE][[3, 11, 19]].T
                         target = torch.expm1(z.double() * arrays.std[8] + arrays.mean[8]).clamp_min(0)
@@ -226,6 +267,11 @@ def validate(model, gpu, stage, fold, rank, world, arrays):
             reach_nse = reaches.nse(min_count=30)
             results["reaches"] = float(np.nanmean(np.nanmedian(reach_nse, axis=0)))
             results["score"] = (results["gauged"] + results["hidden"] + results["reaches"]) / 3
+            if below[-1] > 0 or dist.is_initialized():
+                if dist.is_initialized():
+                    dist.all_reduce(below)
+                if below[-1] > 0:
+                    results["below_quantile"] = [round(float(x), 4) for x in below[:-1] / below[-1]]  # nominal: QUANTILES
     model.train()
     return results
 
@@ -244,6 +290,8 @@ def main():
     p.add_argument("--nwm-weight", type=float, default=0.3)
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--delta-weight", type=float, default=0.01, help="Observed-head penalty")
+    p.add_argument("--loss", choices=["bounded", "nse-q"], default="bounded", help="Stage B gauge loss (see the module docstring)")
+    p.add_argument("--tail-weight", type=float, default=1.0, help="nse-q: weight of the pinball loss")
     p.add_argument("--validate-every", type=int, default=1000)
     p.add_argument("--workers", type=int, default=5)
     p.add_argument("--seed", type=int, default=1)
@@ -268,7 +316,7 @@ def train(a, rank, world, device):
         atomic_json(out / "arguments.json", {k: str(v) for k, v in vars(a).items()})
     s = samples()
     arrays = s.arrays
-    model = HydroModel(s.network.groups, s.network.delay, hidden=a.hidden).to(device)
+    model = HydroModel(s.network.groups, s.network.delay, hidden=a.hidden, quantiles=a.loss == "nse-q").to(device)
     if a.init:  # stage A trains runoff and routing only; every head starts fresh
         state = torch.load(a.init, map_location="cpu", weights_only=False)
         if a.whole:
@@ -321,12 +369,17 @@ def train(a, rank, world, device):
                     )
                     # Gauges: the forecast (gauge head where visible) and the routed observed
                     # head (the ungauged forecast) at every training gauge.
-                    observed, spread = gauge_loss(outputs["gauge"], outputs["sigma"], b, trained)
-                    routed, _ = gauge_loss(outputs["routed_gauge"], outputs["sigma"], b, trained)
-                    observed = 0.5 * (observed + routed)
                     stay = outputs["delta"].pow(2).mean()
-                    loss = observed + a.nwm_weight * prior + 0.1 * spread + a.delta_weight * stay
-                    parts = (observed.item(), prior.item(), spread.item())
+                    if a.loss == "nse-q":
+                        observed, tail = tail_loss(outputs, b, trained)
+                        loss = observed + a.nwm_weight * prior + a.tail_weight * tail + a.delta_weight * stay
+                        parts = (observed.item(), prior.item(), tail.item())
+                    else:
+                        observed, spread = gauge_loss(outputs["gauge"], outputs["sigma"], b, trained)
+                        routed, _ = gauge_loss(outputs["routed_gauge"], outputs["sigma"], b, trained)
+                        observed = 0.5 * (observed + routed)
+                        loss = observed + a.nwm_weight * prior + 0.1 * spread + a.delta_weight * stay
+                        parts = (observed.item(), prior.item(), spread.item())
                 (loss / a.accumulate).backward()
             running += np.array([loss.item(), *parts])
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -337,7 +390,7 @@ def train(a, rank, world, device):
             running[:] = 0
             minutes = (time.perf_counter() - began) / 60
             print(
-                f"update {update}/{a.updates} loss {r[0]:.4f} (obs {r[1]:.4f} nwm {r[2]:.4f} spread {r[3]:.4f}) "
+                f"update {update}/{a.updates} loss {r[0]:.4f} (obs {r[1]:.4f} nwm {r[2]:.4f} {'tail' if a.loss == 'nse-q' else 'spread'} {r[3]:.4f}) "
                 f"lr {lr:.2e} {minutes:.1f} min",
                 flush=True,
             )

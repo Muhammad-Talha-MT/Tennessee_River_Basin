@@ -41,6 +41,23 @@ from targets, inputs and selection. Stage B selects on 2019: the mean of median 
 training gauges with history shown, with history hidden, and against the NWM
 retrospective at every reach, over leads 24-120 h.
 
+### Loss variant: NSE\* and a tail head (`--loss nse-q`)
+
+The default stage-B loss is the bounded NSE above. With `--loss nse-q` (stage A and its weights are
+reused; the NWM prior, selection and data are unchanged) the gauge terms become the NSE\* loss
+(Kratzert et al. 2019: squared error over (gauge flow std + 0.1 m3/s)^2, no log terms, no flood weight)
+on the gauge head and the routed observed head, plus the pinball loss of a tail head that outputs the
+0.5, 0.9 and 0.99 flow quantiles at every gauge and lead (each the detached forecast times exp of a
+non-decreasing offset, so the tail loss never moves the mean). The spread term is dropped and the
+observed-head penalty is set to 0. The mean forecast is scored as before; the upper quantiles are for
+flood probabilities and warnings. Validation logs the share of 2019 observations below each quantile
+(`below_quantile`, nominal 0.5, 0.9, 0.99).
+
+```bash
+torchrun --standalone --nproc_per_node 4 -m tva_flood.hydro.train --stage B --out models/gefs_nseq_B \
+  --init models/gefs_hydro_A/best.pt --loss nse-q --delta-weight 0 --updates 3000 --lr 3e-4 --warmup 100 --validate-every 500
+```
+
 ## Commands
 
 ```bash

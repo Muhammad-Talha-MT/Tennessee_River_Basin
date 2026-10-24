@@ -1,7 +1,7 @@
 """Forecasts for the strength analysis of the graph model (torchrun, all GPUs).
 
 At every test issue (as ``tva_flood.hydro.evaluate``), at every catalog gauge, the mean
-forecast and the log-flow spread sigma of
+forecast and the 0.5, 0.9 and 0.99 flow quantiles of the tail head of
   shown:  the all-gauge model, every gauge's recent flow visible (the gauged test);
   hidden: the all-gauge model, no gauge's recent flow visible (value of the gauge);
   fold:   each fold model at its own withheld gauges (the ungauged test).
@@ -10,7 +10,7 @@ present). Around Hurricane Helene (issues 2024-09-22 to 09-29) also the forecast
 reach: the all-gauge model with GEFS rain and with realized rain, and the fold composite
 (a reach in a gauge's basin takes that gauge's fold model).
 
-  torchrun --standalone --nproc_per_node 4 scripts/strength_forecasts.py --out models/gefs_strength
+  torchrun --standalone --nproc_per_node 4 scripts/strength_forecasts.py --out models/gnn_strength
 """
 
 import argparse
@@ -34,8 +34,8 @@ HELENE = pd.date_range("2024-09-22", "2024-09-29", freq="D")
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--model", type=Path, default=P.MODELS / "gefs_hydro_B/best.pt")
-    p.add_argument("--fold-models", default=str(P.MODELS / "gefs_hydro_B_f{k}/best.pt"))
+    p.add_argument("--model", type=Path, default=P.MODELS / "gnn_B/best.pt")
+    p.add_argument("--fold-models", default=str(P.MODELS / "gnn_B_f{k}/best.pt"))
     p.add_argument("--limit", type=int, default=0, help="First n issues and two Helene issues only (testing)")
     a = p.parse_args()
     rank, world, local = (int(os.environ.get(k, d)) for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0)))
@@ -72,18 +72,18 @@ def main():
                 withheld = gauge_fold == k if k else none
                 view = gpu.with_gauges(base, s.gauge_view(step, s.eligible(step, withheld), withheld))
                 out = model(gpu.with_rain(view, rain), full=full)
-                mu, sigma = (out[key][:, FUTURE].T.float().cpu().numpy() if key == "gauge" else out[key].T.float().cpu().numpy() for key in ("gauge", "sigma"))
+                mu, q = out["gauge"][:, FUTURE].T.float().cpu().numpy(), out["quantile"].permute(1, 0, 2).float().cpu().numpy()
                 if k == 0:
-                    row.update(shown_mu=mu, shown_sigma=sigma)
+                    row.update(shown_mu=mu, shown_q=q)
                     hidden = model(gpu.with_rain(gpu.with_gauges(base, s.gauge_view(step, none, none)), rain))
-                    row.update(hidden_mu=hidden["gauge"][:, FUTURE].T.float().cpu().numpy(), hidden_sigma=hidden["sigma"].T.float().cpu().numpy())
-                    row.update(fold_mu=np.full_like(mu, np.nan), fold_sigma=np.full_like(sigma, np.nan))
+                    row.update(hidden_mu=hidden["gauge"][:, FUTURE].T.float().cpu().numpy(), hidden_q=hidden["quantile"].permute(1, 0, 2).float().cpu().numpy())
+                    row.update(fold_mu=np.full_like(mu, np.nan), fold_q=np.full_like(q, np.nan))
                     if full:
                         reach["model"] = out["reach"][:, FUTURE].T
                         reach["fold"] = reach["model"].clone()
                         reach["model_aorc"] = model(view, full=True)["reach"][:, FUTURE].T.float().cpu().numpy()
                 else:
-                    row["fold_mu"][:, withheld], row["fold_sigma"][:, withheld] = mu[:, withheld], sigma[:, withheld]
+                    row["fold_mu"][:, withheld], row["fold_q"][:, withheld] = mu[:, withheld], q[:, withheld]
                     if full:
                         reach["fold"] = torch.where((reach_model == k)[None], out["reach"][:, FUTURE].T, reach["fold"])
             rows.append(row)

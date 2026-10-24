@@ -1,13 +1,13 @@
-"""Figures of the graph model (models/gefs_hydro_B and folds) under the strict forecast rule.
+"""Figures of the graph model (models/gnn_B and folds) under the strict forecast rule.
 
     python scripts/strict_rule_figures.py --out /data/tva_data/figures/strict_rule
 
 Every forecast uses observed data before the 00Z issue and GEFSv12 rain after it; "realized
 rain" panels are a perfect-rain diagnostic. Methods share issues, gauges and values (the
 evaluation's mask with every method present). Sources:
-  models/gefs_evaluation_full   forecasts at gauges and held-out gauges, metrics at every reach
+  models/gnn_evaluation         forecasts at gauges and held-out gauges, metrics at every reach
   models/gefs_benchmark(_f1..5) the GEFS-rule LSTM (all gauges and with each fold withheld)
-  models/gefs_strength          spread, history hidden, and Hurricane Helene at every reach
+  models/gnn_strength           tail quantiles, history hidden, and Hurricane Helene at every reach
                                 (scripts/strength_forecasts.py)
 Maps are in the Albers equal-area projection (EPSG:5070) at true aspect.
 """
@@ -23,7 +23,6 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.colors import LogNorm, TwoSlopeNorm  # noqa: E402
-from scipy.stats import norm  # noqa: E402
 
 from tva_flood.data.folds import holdout_folds  # noqa: E402
 from tva_flood.data.gauges import Catalog  # noqa: E402
@@ -82,7 +81,7 @@ class Data:
         self.cat = Catalog(P.GAUGES)
         self.names = pd.Index(self.cat.names)
         self.fold = holdout_folds(P.ROOT, self.cat, 5)
-        E = P.MODELS / "gefs_evaluation_full"
+        E = P.MODELS / "gnn_evaluation"
         g, u = (np.load(E / f"forecasts_{k}.npz", allow_pickle=True) for k in ("gauged", "ungauged"))
         self.times = pd.DatetimeIndex(g["time"])
         assert (pd.DatetimeIndex(u["time"]) == self.times).all() and list(g["stations"]) == list(self.names)
@@ -104,9 +103,9 @@ class Data:
         self.reach = np.load(E / "reach_metrics.npz")
         self.reach_area = self.area.reindex(self.reach["comid"]).to_numpy()
         self.regulated = np.load(P.HYDRO / "dams.npz")["regulated"]
-        self.strength = np.load(P.MODELS / "gefs_strength/gauges.npz", allow_pickle=True)
+        self.strength = np.load(P.MODELS / "gnn_strength/gauges.npz", allow_pickle=True)
         assert (pd.DatetimeIndex(self.strength["time"]) == self.times).all()
-        self.helene = np.load(P.MODELS / "gefs_strength/helene.npz", allow_pickle=True)
+        self.helene = np.load(P.MODELS / "gnn_strength/helene.npz", allow_pickle=True)
         train = self.cat.times < P.TRAIN_UNTIL
         with np.errstate(all="ignore"):
             self.p90 = np.nanquantile(self.cat.observed[train], 0.90, axis=0)
@@ -426,7 +425,8 @@ def flood_peaks(d, out, events):
         ax.axhline(0, color=GRAY, lw=1, ls="--")
         ax.set_title(f"{protocol.capitalize()}: {n:,} peaks above the 99th percentile", color=NAVY, fontsize=11)
     axes[0].set_ylabel("forecast peak / observed peak - 1 (%)")
-    axes[1].legend([plt.Rectangle((0, 0), 1, 1, color=COLOR[m]) for m in ("GNN", "LSTM", "NWM")], ["GNN", "LSTM", "NWM"], loc="upper right")
+    axes[0].set_ylim(-110, 130)
+    axes[1].legend([plt.Rectangle((0, 0), 1, 1, color=COLOR[m]) for m in ("GNN", "LSTM", "NWM")], ["GNN", "LSTM", "NWM"], loc="upper right", ncol=3)
     save(fig, out, "g9_flood_peaks.png")
 
 
@@ -508,41 +508,100 @@ def value_of_gauge(d, out):
     save(fig, out, "g12_value_of_the_gauge.png")
 
 
-def lognormal_crps(y, mu, sigma):
-    z = (np.log(y) - mu) / sigma
-    return y * (2 * norm.cdf(z) - 1) - 2 * np.exp(mu + sigma ** 2 / 2) * (norm.cdf(z - sigma) + norm.cdf(sigma / np.sqrt(2)) - 1)
-
-
-def calibration(d, out):
-    """g13: interval coverage, PIT and CRPS against point errors."""
+def tail(d, out, events):
+    """g13-g15: the tail head's quantiles (0.5, 0.9, 0.99): calibration and pinball loss, flood warnings, and peaks."""
     s = d.strength
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.6))
     held = d.fold[None, None] > 0
-    cases = (("gauged", s["shown_mu"], s["shown_sigma"], d.truth_g, d.gauged["LSTM"], "-"),
-             ("ungauged", s["fold_mu"], s["fold_sigma"], np.where(held, d.truth_u, np.nan), d.ungauged["LSTM"], ":"))
-    for label, mu, sigma, truth, lstm, ls in cases:
-        ok = np.isfinite(truth) & np.isfinite(mu) & np.isfinite(sigma) & np.isfinite(lstm)
-        z = np.where(ok, (np.log(np.where(ok, truth, 1) + 0.01) - np.log(np.where(ok, mu, 1) + 0.01)) / np.where(ok, sigma, 1), np.nan)
-        for p_, c in ((0.5, GREEN), (0.8, BLUE), (0.9, NAVY)):
-            cover = np.nansum(np.where(ok, np.abs(z) <= norm.ppf((1 + p_) / 2), 0), axis=(0, 2)) / ok.sum(axis=(0, 2))
-            axes[0].plot(LEAD_H, cover * 100, ls, color=c, lw=2, label=f"{p_:.0%} interval, {label}")
-            axes[0].axhline(p_ * 100, color=c, lw=0.7, alpha=0.5)
-        zz = z[:, D15[0] : D15[-1] + 1]
-        axes[1].hist(norm.cdf(zz[np.isfinite(zz)]), bins=20, range=(0, 1), density=True, histtype="step", lw=2, ls=ls, color=BLUE, label=label)
-        crps = np.where(ok, lognormal_crps(np.where(ok, truth, 1) + 0.01, np.log(np.where(ok, mu, 1) + 0.01), np.where(ok, sigma, 1)), np.nan)
+    cases = (("gauged", s["shown_mu"], s["shown_q"], d.truth_g, d.gauged, "-"),
+             ("ungauged", s["fold_mu"], s["fold_q"], np.where(held, d.truth_u, np.nan), d.ungauged, ":"))
+    qs = (0.5, 0.9, 0.99)
+    colors = (GREEN, BLUE, NAVY)
+    # g13: calibration and pinball loss
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.6))
+    shares = []
+    for label, mu, q, truth, series, ls in cases:
+        ok = np.isfinite(truth) & np.isfinite(mu) & np.isfinite(q).all(-1)
+        for i, (qq, c) in enumerate(zip(qs, colors)):
+            below = np.where(ok, truth <= q[..., i], 0).sum((0, 2)) / ok.sum((0, 2))
+            shares.append(dict(protocol=label, quantile=qq, share_below_24_120h=float(np.mean(below[3:20])), **{f"share_below_{h}h": float(below[h // 6 - 1]) for h in (24, 72, 120, 240)}))
+            axes[0].plot(LEAD_H, below * 100, ls, color=c, lw=2, label=f"q{int(qq * 100)}, {label}")
+            axes[0].axhline(qq * 100, color=c, lw=0.7, alpha=0.5)
         scale = np.nanmean(np.where(ok, truth, np.nan), axis=(0, 1))
-        for name, err, c in (("GNN probabilistic (CRPS)", crps, BLUE), ("GNN mean (MAE)", np.abs(mu - truth), PURPLE),
-                             ("LSTM (MAE)", np.abs(lstm - truth), ORANGE), ("NWM (MAE)", np.abs(d.gauged["NWM"] - truth), GRAY)):
-            e = np.nanmean(np.where(ok, err, np.nan), axis=0) / scale[None]
-            axes[2].plot(LEAD_H, np.nanmedian(e, axis=1), ls, color=c, lw=2, label=f"{name}, {label}")
-    lead_axis(axes[0]); axes[0].set_ylabel("% of observations inside")
-    axes[0].set_title("Coverage of the forecast intervals\n(thin lines: nominal)", color=NAVY, fontsize=11); axes[0].legend(fontsize=8, ncol=2)
-    axes[1].axhline(1, color=GRAY, lw=1, ls="--"); axes[1].set_xlabel("probability integral transform, 24-120 h")
-    axes[1].set_title("Calibration (flat = calibrated;\nU = too narrow, hump = too wide)", color=NAVY, fontsize=11); axes[1].legend()
-    lead_axis(axes[2]); axes[2].set_ylabel("median over gauges of error / mean flow")
-    axes[2].set_title("Probabilistic score vs point errors\n(CRPS = MAE for a single value; lower is better)", color=NAVY, fontsize=11)
-    axes[2].legend(fontsize=7.5, ncol=2)
-    save(fig, out, "g13_calibration.png")
+        for ax, i in zip(axes[1:], (1, 2)):
+            for name, f, c in ((f"GNN q{int(qs[i] * 100)} (pinball)", q[..., i], BLUE), ("GNN mean", mu, PURPLE), ("LSTM", series["LSTM"], ORANGE), ("NWM", d.gauged["NWM"], GRAY)):
+                miss = truth - f
+                qv = qs[i]
+                loss = np.where(ok, np.maximum(qv * miss, (qv - 1) * miss), np.nan)
+                ax.plot(LEAD_H, np.nanmedian(np.nanmean(loss, axis=0) / scale[None], axis=1), ls, color=c, lw=2, label=f"{name}, {label}")
+    lead_axis(axes[0]); axes[0].set_ylabel("% of observations below the quantile")
+    axes[0].set_title("Calibration of the tail (thin lines: nominal)", color=NAVY, fontsize=11); axes[0].legend(fontsize=8, ncol=2)
+    for ax, i in zip(axes[1:], (1, 2)):
+        lead_axis(ax); ax.set_ylabel("pinball loss / mean flow (median over gauges)")
+        ax.set_title(f"Pinball loss at the {int(qs[i] * 100)}th percentile (lower is better)", color=NAVY, fontsize=11); ax.legend(fontsize=8, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.17))
+    pd.DataFrame(shares).round(4).to_csv(out / "g13_tail_calibration.csv", index=False)
+    save(fig, out, "g13_tail_calibration.png")
+    # g14: flood warnings from the mean and from the quantiles
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    rows = []
+    for col, (label, mu, q, truth, series, ls) in enumerate(cases):
+        ok0 = np.isfinite(truth) & np.isfinite(mu) & np.isfinite(q).all(-1)
+        for row, (tag, thr) in enumerate((("90th", d.p90), ("99th", d.p99))):
+            ok = ok0 & np.isfinite(thr)[None, None]
+            ax = axes[row, col]
+            for name, f, c, st in (("GNN mean", mu, BLUE, "-"), ("GNN q90", q[..., 1], PURPLE, "-"), ("GNN q99", q[..., 2], NAVY, "--"), ("LSTM", series["LSTM"], ORANGE, "-"), ("NWM", d.gauged["NWM"], GRAY, "-")):
+                o, fl = truth > thr, f > thr
+                hit, miss, fa = (o & fl & ok).sum((0, 2)), (o & ~fl & ok).sum((0, 2)), (~o & fl & ok).sum((0, 2))
+                csi = hit / np.maximum(hit + miss + fa, 1)
+                ax.plot(LEAD_H, csi, st, color=c, lw=2, label=name)
+                rows += [dict(protocol=label, threshold=tag, warning=name, lead_h=h, csi=csi[h // 6 - 1], hit_rate=(hit / np.maximum(hit + miss, 1))[h // 6 - 1],
+                              false_alarm_ratio=(fa / np.maximum(hit + fa, 1))[h // 6 - 1]) for h in (24, 72, 120, 240)]
+            ax.set_title(f"{label.capitalize()}: floods above the {tag} percentile", color=NAVY, fontsize=11)
+            if row == 1:
+                lead_axis(ax)
+            if col == 0:
+                ax.set_ylabel("critical success index")
+    axes[0, 0].legend(fontsize=9)
+    pd.DataFrame(rows).round(3).to_csv(out / "g14_tail_warnings.csv", index=False)
+    save(fig, out, "g14_tail_warnings.png")
+    # g15: peaks from the mean and the quantiles
+    issue_index = {t_: i for i, t_ in enumerate(d.times)}
+    names = ("GNN mean", "GNN q90", "GNN q99", "LSTM", "NWM")
+    pcolor = {"GNN mean": BLUE, "GNN q90": PURPLE, "GNN q99": NAVY, "LSTM": ORANGE, "NWM": GRAY}
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), sharey=True)
+    peak_errors = {}
+    for ax, (label, mu, q, truth, series, ls) in zip(axes, cases):
+        fc = {"GNN mean": mu, "GNN q90": q[..., 1], "GNN q99": q[..., 2], "LSTM": series["LSTM"], "NWM": d.gauged["NWM"]}
+        errs = {(n, k): [] for n in names for k in (1, 3, 5)}
+        for gi, t0, qv in events:
+            if label == "ungauged" and d.fold[gi] == 0:
+                continue
+            for days in (1, 3, 5):
+                i = issue_index.get((t0 - pd.Timedelta(days=days)).normalize())
+                if i is None:
+                    continue
+                target = int((t0 - d.times[i]) / pd.Timedelta(hours=6)) - 1
+                lo, hi = max(target - 8, 0), min(target + 9, 40)
+                w = {n: v[i, lo:hi, gi] for n, v in fc.items()}
+                if all(len(x) and np.isfinite(x).all() for x in w.values()):
+                    for n, x in w.items():
+                        errs[(n, days)].append(x.max() / qv - 1)
+        peak_errors[label] = errs
+        for k, days in enumerate((1, 3, 5)):
+            for j, n in enumerate(names):
+                bp = ax.boxplot(np.clip(np.array(errs[(n, days)]) * 100, -100, 400), positions=[k * 6.5 + j], widths=0.8, showfliers=False, patch_artist=True)
+                for bx in bp["boxes"]:
+                    bx.set(facecolor=pcolor[n], alpha=0.75, edgecolor=NAVY)
+                for md in bp["medians"]:
+                    md.set(color=NAVY)
+        ax.set_xticks([2, 8.5, 15]); ax.set_xticklabels(["issued 1 day\nbefore the peak", "3 days", "5 days"])
+        ax.axhline(0, color=GRAY, lw=1, ls="--")
+        ax.set_title(f"{label.capitalize()}: peaks above the 99th percentile ({len(errs[('NWM', 1)]):,} floods)", color=NAVY, fontsize=11)
+    pd.DataFrame([dict(protocol=lab, forecast=n, days_ahead=k, events=len(v), median_peak_error=float(np.median(v)))
+                  for lab, errs_ in peak_errors.items() for (n, k), v in errs_.items() if v]).round(3).to_csv(out / "g15_tail_peaks.csv", index=False)
+    axes[0].set_ylabel("forecast peak / observed peak - 1 (%)")
+    axes[0].set_ylim(-110, 520)
+    axes[1].legend([plt.Rectangle((0, 0), 1, 1, color=pcolor[n]) for n in names], names, loc="upper right", fontsize=9, ncol=5)
+    save(fig, out, "g15_tail_peaks.png")
 
 
 def skill_lost(d, out):
@@ -575,7 +634,7 @@ def gauge_maps(d, out, maps):
 
 
 # ------------------------------------------------------------------ every reach
-REACH = {"GNN": "new model+gefs", "LSTM": "LSTM, tuned+gefs", "NWM": "NWM forecast", "persistence": "retrospective persistence (oracle)"}
+REACH = {"GNN": "GNN+gefs", "LSTM": "LSTM, tuned+gefs", "NWM": "NWM forecast", "persistence": "retrospective persistence (oracle)"}
 
 
 def reach_by_lead(d, out):
@@ -588,7 +647,7 @@ def reach_by_lead(d, out):
     for ax, (scope, sel) in zip(axes, scopes):
         for m, key in REACH.items():
             ax.plot(LEAD_H, np.nanmedian(r[f"{key}/nse"][:, sel], axis=1), color=COLOR[m], lw=2.2, label="retrospective persistence (oracle)" if m == "persistence" else m)
-        ax.plot(LEAD_H, np.nanmedian(r["new model+aorc/nse"][:, sel], axis=1), "--", color=BLUE, lw=1.4, label="GNN, realized rain")
+        ax.plot(LEAD_H, np.nanmedian(r["GNN+aorc/nse"][:, sel], axis=1), "--", color=BLUE, lw=1.4, label="GNN, realized rain")
         ax.axhline(0, color=GRAY, lw=0.8); ax.set_ylim(-1.5, 1)
         lead_axis(ax); ax.set_title(f"{scope} ({sel.sum():,})", color=NAVY, fontsize=11)
     axes[0].set_ylabel("median NSE against the\nNWM v3.0 retrospective"); axes[0].legend(fontsize=8.5)
@@ -739,7 +798,7 @@ def main():
     hydrographs(d, a.out, events, "ungauged")
     full_metrics(d, a.out)
     value_of_gauge(d, a.out)
-    calibration(d, a.out)
+    tail(d, a.out, events)
     skill_lost(d, a.out)
     gauge_maps(d, a.out, maps)
     reach_by_lead(d, a.out)

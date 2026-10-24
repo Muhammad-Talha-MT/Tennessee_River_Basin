@@ -138,6 +138,53 @@ class Trunk(nn.Module):
         return h
 
 
+class AttentionLayer(nn.Module):
+    """Pre-norm transformer layer over time: causal multi-head self-attention, then a feed-forward block."""
+
+    def __init__(self, hidden, heads):
+        super().__init__()
+        self.heads = heads
+        self.norm1, self.norm2 = nn.LayerNorm(hidden), nn.LayerNorm(hidden)
+        self.qkv = nn.Linear(hidden, 3 * hidden)
+        self.out = nn.Linear(hidden, hidden)
+        self.ff = nn.Sequential(nn.Linear(hidden, 2 * hidden), nn.GELU(), nn.Linear(2 * hidden, hidden))
+
+    def forward(self, x):
+        b, steps, c = x.shape
+        q, k, v = self.qkv(self.norm1(x)).view(b, steps, 3, self.heads, c // self.heads).permute(2, 0, 3, 1, 4)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # a step sees itself and the steps before it
+        x = x + self.out(a.transpose(1, 2).reshape(b, steps, c))
+        return x + self.ff(self.norm2(x))
+
+
+class AttentionTrunk(nn.Module):
+    """``Trunk`` with causal self-attention over time in place of the per-reach LSTM: the same inputs and outputs, the same
+    chunking over reaches and the same graph layers. A learned embedding gives each step its position relative to the issue."""
+
+    def __init__(self, hidden, channels, graph_layers, heads=4, layers=2, chunk=8000, compile=False):
+        super().__init__()
+        self.inputs = nn.Linear(STEP_INPUTS, hidden)
+        self.reach = mlp(REACH_INPUTS, hidden, hidden)
+        self.position = nn.Parameter(torch.zeros(P.WINDOW, hidden))
+        nn.init.normal_(self.position, std=0.02)
+        self.layers = nn.ModuleList(AttentionLayer(hidden, heads) for _ in range(layers))
+        if compile:  # fuses the norms, activations and residual adds (about 25% faster); checkpoint keys are unchanged
+            for layer in self.layers:
+                layer.compile()
+        self.norm = nn.LayerNorm(hidden)
+        self.down = nn.Linear(hidden, channels)
+        self.blocks = nn.ModuleList(GraphBlock(channels) for _ in range(graph_layers))
+        self.chunk = chunk
+
+    def _time(self, steps, reach):
+        h = self.inputs(steps) + self.reach(reach)[:, None, :] + self.position[None, : steps.shape[1]]
+        for layer in self.layers:
+            h = layer(h)
+        return self.down(self.norm(h)[:, -P.FLOW_STEPS :])
+
+    forward = Trunk.forward
+
+
 class Router(nn.Module):
     """Mass-conserving routing of lateral inflow with one travel-time kernel per group."""
 
@@ -389,3 +436,12 @@ class HydroModel(nn.Module):
             everywhere[reach] = gauge
             out["reach"] = everywhere
         return out
+
+
+class AttentionGNN(HydroModel):
+    """The graph-routing model with an attention trunk: everything but the per-reach temporal model is ``HydroModel``."""
+
+    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False, head=None, heads=4, layers=2, compile=False):
+        super().__init__(groups, delay, hidden, channels, graph_layers, quantiles, head)
+        self.trunk = AttentionTrunk(hidden, channels, graph_layers, heads, layers, compile=compile)
+        self.config.update(kind="attention", attention=dict(heads=heads, layers=layers))

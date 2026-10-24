@@ -96,3 +96,28 @@ def test_pinball_penalizes_a_quantile_below_the_truth_by_q_and_above_by_one_minu
     above = torch.full((1, 4, 3), 12.0)  # exceeds by 2: loss (1 - q) * 2
     assert abs(float(pinball(below, truth, valid, std)) - 2 * (0.5 + 0.9 + 0.99) / 3) < 1e-5
     assert abs(float(pinball(above, truth, valid, std)) - 2 * (0.5 + 0.1 + 0.01) / 3) < 1e-5
+
+
+def test_attention_trunk_is_causal_and_keeps_the_trunk_interface():
+    from tva_flood.hydro.model import REACH_INPUTS, STEP_INPUTS, AttentionTrunk
+
+    torch.manual_seed(0)
+    trunk = AttentionTrunk(hidden=16, channels=8, graph_layers=1, heads=2, layers=2).eval()
+    steps = torch.randn(3, P.WINDOW, STEP_INPUTS)
+    reach = torch.randn(3, REACH_INPUTS)
+    before = trunk._time(steps, reach)
+    assert before.shape == (3, P.FLOW_STEPS, 8)
+    later = steps.clone()
+    later[:, 150:] += 5.0  # change only the steps from 150 on
+    after = trunk._time(later, reach)
+    changed_from = 150 - (P.WINDOW - P.FLOW_STEPS)  # outputs cover the last FLOW_STEPS steps
+    assert torch.allclose(before[:, :changed_from], after[:, :changed_from], atol=1e-6)  # nothing earlier moved
+    assert not torch.allclose(before[:, changed_from:], after[:, changed_from:])  # the changed steps did
+
+
+def test_attention_model_config_round_trips():
+    from tva_flood.hydro.model import AttentionGNN
+
+    model = AttentionGNN([0.0] * 3, np.zeros(3), hidden=16, channels=8, graph_layers=1, heads=2, layers=1)
+    assert model.config["kind"] == "attention" and model.config["attention"] == dict(heads=2, layers=1)
+    assert not hasattr(model.trunk, "lstm") and hasattr(model.trunk, "layers")

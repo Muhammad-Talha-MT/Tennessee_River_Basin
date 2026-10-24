@@ -47,7 +47,7 @@ from tva_flood.evaluation.hydrology import Accumulator, reach_metrics
 from . import paths as P
 from .data import timeline_index
 from .legacy import HydroModelV1
-from .model import HydroModel
+from .model import AttentionGNN, HydroModel
 from .samples import Device, Samples
 
 FUTURE = slice(P.INNOVATION, P.SCORED)
@@ -62,7 +62,11 @@ METRICS = ("nse", "kge", "r", "alpha", "beta", "rmse", "peak_error", "peak_error
 def load_model(path, s, device, legacy=False):
     state = torch.load(path, map_location="cpu", weights_only=False)
     c = state["config"]
-    model = (HydroModelV1 if legacy else HydroModel)(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **{k: c[k] for k in ("quantiles", "head") if k in c})
+    extra = {k: c[k] for k in ("quantiles", "head") if k in c}
+    if c.get("kind") == "attention":
+        model = AttentionGNN(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **extra, **c["attention"])
+    else:
+        model = (HydroModelV1 if legacy else HydroModel)(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **extra)
     model.load_state_dict(state["model"])
     model.to(device).eval()
     model.attach(s.network, s.network.edges, s.gauges.reach, device)

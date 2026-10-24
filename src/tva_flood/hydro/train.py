@@ -56,7 +56,7 @@ from tva_flood.training.runtime import save_atomic
 
 from . import paths as P
 from .data import timeline_index
-from .model import QUANTILES, HydroModel
+from .model import QUANTILES, AttentionGNN, HydroModel
 from .samples import Device, Samples
 
 DAYS_1_5 = [3, 7, 11, 15, 19]  # lead indices of 24, 48, 72, 96, 120 h
@@ -294,6 +294,7 @@ def main():
     p.add_argument("--delta-weight", type=float, default=0.01, help="Observed-head penalty")
     p.add_argument("--loss", choices=["bounded", "nse-q"], default="bounded", help="Stage B gauge loss (see the module docstring)")
     p.add_argument("--tail-weight", type=float, default=1.0, help="nse-q: weight of the pinball loss")
+    p.add_argument("--trunk", choices=["lstm", "attention"], default="lstm", help="Per-reach temporal model: an LSTM, or causal self-attention (AttentionGNN)")
     p.add_argument("--head", choices=["small", "lstm"], default="small", help="Gauge head: 64 units, log1p/5 inputs; or 256 units with the LSTM's scaling and inputs")
     p.add_argument("--validate-every", type=int, default=1000)
     p.add_argument("--workers", type=int, default=5)
@@ -322,7 +323,8 @@ def train(a, rank, world, device):
     head = None
     if a.head == "lstm":  # 256 units, the LSTM baseline's log-flow scaling and its inputs (basin weather and attributes)
         head = dict(hidden=256, scale="z", lstm_inputs=True, flow_mean=float(arrays.mean[8]), flow_std=float(arrays.std[8]))
-    model = HydroModel(s.network.groups, s.network.delay, hidden=a.hidden, quantiles=a.loss == "nse-q", head=head).to(device)
+    Model, extra = (AttentionGNN, dict(compile=True)) if a.trunk == "attention" else (HydroModel, {})
+    model = Model(s.network.groups, s.network.delay, hidden=a.hidden, quantiles=a.loss == "nse-q", head=head, **extra).to(device)
     if a.init:  # stage A trains runoff and routing only; every head starts fresh
         state = torch.load(a.init, map_location="cpu", weights_only=False)
         if a.whole:

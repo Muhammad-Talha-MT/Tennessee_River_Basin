@@ -705,22 +705,29 @@ def reach_distribution(d, out):
 
 
 def reach_maps(d, out, maps):
-    """r4: NSE at every reach, GNN and NWM, and their difference, at 24 h and 72 h."""
+    """r4: NSE at every reach for the GNN, the LSTM and NWM, and the GNN's gain over NWM and over the LSTM, at 24 h and 72 h."""
     comid = d.reach["comid"]
     area = pd.Series(d.reach_area, index=comid)
     for h in (24, 72):
-        gnn = pd.Series(d.reach[f"{REACH['GNN']}/nse"][h // 6 - 1], index=comid)
-        nwm = pd.Series(d.reach[f"{REACH['NWM']}/nse"][h // 6 - 1], index=comid)
+        nse_ = {m: pd.Series(d.reach[f"{REACH[m]}/nse"][h // 6 - 1], index=comid) for m in ("GNN", "LSTM", "NWM")}
         fig, axes = maps.figure(3, 1, width=10)
-        panels = ((gnn, "GNN", "viridis", plt.Normalize(-1, 1)), (nwm, "NWM forecast", "viridis", plt.Normalize(-1, 1)),
-                  (gnn - nwm, "GNN minus NWM (blue: GNN better)", "RdBu", TwoSlopeNorm(0, -0.5, 0.5)))
-        for ax, (v, title, cmap, nrm) in zip(axes[:, 0], panels):
+        for ax, (m, title) in zip(axes[:, 0], (("GNN", "GNN"), ("LSTM", "LSTM (run at every reach)"), ("NWM", "NWM forecast"))):
+            nrm = plt.Normalize(-1, 1)
             maps.frame(ax)
-            maps.rivers(ax, v.clip(-1, 1), cmap, nrm, area)
-            fig.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=nrm), ax=ax, shrink=0.8, label="NSE" if "minus" not in title else "NSE difference")
-            extra = f"; GNN better at {np.nanmean((gnn - nwm).to_numpy() > 0):.0%} of reaches" if "minus" in title else f"; median {np.nanmedian(v):.3f}"
-            ax.set_title(f"{h} h: {title}{extra}", color=NAVY, fontsize=11)
+            maps.rivers(ax, nse_[m].clip(-1, 1), "viridis", nrm, area)
+            fig.colorbar(plt.cm.ScalarMappable(cmap="viridis", norm=nrm), ax=ax, shrink=0.8, label="NSE (clipped at -1)")
+            ax.set_title(f"{h} h: {title}; median {np.nanmedian(nse_[m]):.3f}", color=NAVY, fontsize=11)
         save(fig, out, f"r4_reach_maps_{h}h.png")
+        fig, axes = maps.figure(2, 1, width=10)
+        for ax, (other, title, lim) in zip(axes[:, 0], (("NWM", "GNN minus NWM forecast", 0.5), ("LSTM", "GNN minus LSTM", 1.0))):
+            diff = nse_["GNN"].clip(-1, 1) - nse_[other].clip(-1, 1)
+            nrm = TwoSlopeNorm(0, -lim, lim)
+            maps.frame(ax)
+            maps.rivers(ax, diff, "RdBu", nrm, area)
+            fig.colorbar(plt.cm.ScalarMappable(cmap="RdBu", norm=nrm), ax=ax, shrink=0.8, label="NSE difference")
+            better = np.nanmean((nse_["GNN"] - nse_[other]).to_numpy() > 0)
+            ax.set_title(f"{h} h: {title} (blue: GNN better, at {better:.0%} of reaches)", color=NAVY, fontsize=11)
+        save(fig, out, f"r4_reach_gain_maps_{h}h.png")
 
 
 # ------------------------------------------------------------------ Hurricane Helene

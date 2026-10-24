@@ -725,8 +725,9 @@ def reach_maps(d, out, maps):
             maps.frame(ax)
             maps.rivers(ax, diff, "RdBu", nrm, area)
             fig.colorbar(plt.cm.ScalarMappable(cmap="RdBu", norm=nrm), ax=ax, shrink=0.8, label="NSE difference")
-            better = np.nanmean((nse_["GNN"] - nse_[other]).to_numpy() > 0)
-            ax.set_title(f"{h} h: {title} (blue: GNN better, at {better:.0%} of reaches)", color=NAVY, fontsize=11)
+            both = np.isfinite(nse_["GNN"].to_numpy()) & np.isfinite(nse_[other].to_numpy())  # reaches scored by both
+            better = ((nse_["GNN"] - nse_[other]).to_numpy()[both] > 0).mean()
+            ax.set_title(f"{h} h: {title} (blue: GNN better, at {better:.0%} of the {int(both.sum()):,} reaches scored by both)", color=NAVY, fontsize=10.5)
         save(fig, out, f"r4_reach_gain_maps_{h}h.png")
 
 

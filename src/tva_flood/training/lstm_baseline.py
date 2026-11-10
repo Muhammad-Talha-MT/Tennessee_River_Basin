@@ -128,6 +128,11 @@ def main():
     p.add_argument("--raw-weight", type=float, default=1.0)
     p.add_argument("--high-flow-weight", type=float, default=2.0)
     p.add_argument("--history-hide", type=float, default=0.1)
+    p.add_argument(
+        "--validation-hidden",
+        action="store_true",
+        help="Select on the mean of the score with flow history shown and with it hidden (as the graph model)",
+    )
     p.add_argument("--unknown-rain-prob", type=float, default=0.2)
     p.add_argument("--rain-cut-prob", type=float, default=0.5, help="Rain known to a shorter lead")
     p.add_argument("--forecast-rain", type=Path, help="Public rain forecasts (download-gefs)")
@@ -281,13 +286,23 @@ def main():
     print(f"{len(train_issue):,} training (issue, gauge) pairs; {len(v_issue)} validation issues")
 
     def validate():
+        score, extra = validate_view(hidden=False)
+        if not a.validation_hidden:
+            return score, extra
+        hidden_score, hidden_extra = validate_view(hidden=True)
+        extra = dict(extra, shown_selection=score, hidden_selection=hidden_score)
+        extra.update({f"hidden_{k}": v for k, v in hidden_extra.items()})
+        return 0.5 * (score + hidden_score), extra
+
+    def validate_view(hidden):
         model.eval()
         predictions = np.full((len(v_issue), HORIZON, len(catalog)), np.nan)
         targets = np.full_like(predictions, np.nan)
+        hide_all = np.full(len(v_issue), hidden)
         with torch.no_grad():
             for g in v_gauges:
                 gauges = np.full(len(v_issue), g)
-                history, static, rain, target = series.batch(v_issue, gauges, rain_steps)
+                history, static, rain, target = series.batch(v_issue, gauges, rain_steps, hide_all if hidden else None)
                 if a.validation_rain:
                     day = forecast_day[a.validation_rain][v_issue]
                     rain = forecast_basin[a.validation_rain][day, g]

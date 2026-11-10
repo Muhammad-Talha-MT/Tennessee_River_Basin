@@ -51,12 +51,12 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 
 from tva_flood.common import atomic_json
-from tva_flood.data.folds import holdout_folds
 from tva_flood.training.runtime import save_atomic
 
 from . import paths as P
+from . import splits
 from .data import timeline_index
-from .model import QUANTILES, AttentionGNN, HydroModel
+from .model import ABLATIONS, QUANTILES, AttentionGNN, HydroModel, LumpedModel
 from .samples import Device, Samples
 
 DAYS_1_5 = [3, 7, 11, 15, 19]  # lead indices of 24, 48, 72, 96, 120 h
@@ -72,18 +72,26 @@ def samples():
     return SAMPLES
 
 
-def withheld_gauges(fold, folds=5):
-    s = samples()
-    if not fold:
-        return np.zeros(s.gauges.count, bool)
-    return holdout_folds(P.ROOT, s.gauges.catalog, folds) == fold
+SPLIT = dict(scheme="random", keep=1.0, keep_seed=0)  # set from the arguments (``splits``)
+WITHHELD = {}
+
+
+def withheld_gauges(fold, split=None):
+    """Gauges the model for ``fold`` never sees, under ``split`` (default: this run's ``SPLIT``)."""
+    split = split or SPLIT
+    key = (fold, split["scheme"], split["keep"], split["keep_seed"])
+    if key not in WITHHELD:
+        s = samples()
+        WITHHELD[key] = splits.withheld(s.gauges, s.network, fold, split["scheme"], split["keep"], split["keep_seed"])
+    return WITHHELD[key]
 
 
 class Schedule(Dataset):
-    """Fixed list of (issue step, visibility seed) entries for one rank."""
+    """Fixed list of (issue step, visibility seed) entries for one rank. ``reaches`` > 0 (lumped model): each
+    sample also lists that many random reaches plus every gauge reach (``rows``), the reaches trained on."""
 
-    def __init__(self, entries, fold, stage):
-        self.entries, self.fold, self.stage = entries, fold, stage
+    def __init__(self, entries, fold, stage, split, reaches=0):
+        self.entries, self.fold, self.stage, self.split, self.reaches = entries, fold, stage, split, reaches
 
     def __len__(self):
         return len(self.entries)
@@ -91,13 +99,17 @@ class Schedule(Dataset):
     def __getitem__(self, i):
         step, seed = self.entries[i]
         s = samples()
-        withheld = withheld_gauges(self.fold)
+        withheld = withheld_gauges(self.fold, self.split)
         visible = None
+        rng = np.random.default_rng(seed)
         if self.stage == "B":
-            rng = np.random.default_rng(seed)
             if rng.random() >= 0.15:
                 visible = s.eligible(step, withheld) & (rng.random(s.gauges.count) < 0.5)
-        return s.build(step, "gefs_reforecast", visible, withheld)
+        sample = s.build(step, "gefs_reforecast", visible, withheld)
+        if self.reaches:
+            pick = rng.choice(s.network.n, self.reaches, replace=False)
+            sample["rows"] = np.unique(np.concatenate([pick, s.gauges.reach])).astype(np.int64)
+        return sample
 
 
 def reforecast_issues(first, last):
@@ -221,10 +233,18 @@ class Sums:
         return torch.where(ok, 1 - se / (n * var).clamp_min(1e-12), torch.nan).cpu().numpy()
 
 
-def validate(model, gpu, stage, fold, rank, world, arrays):
+def selection_score(results, rule):
+    """Checkpoint score: "all" (the default, as every earlier model) is the mean of gauged, hidden and the NWM
+    every-reach score; "gauges" leaves out the NWM score, so models trained without NWM select like the others."""
+    parts = ("gauged", "hidden", "reaches") if rule == "all" else ("gauged", "hidden")
+    return float(np.mean([results[k] for k in parts]))
+
+
+def validate(model, gpu, stage, fold, rank, world, arrays, rule="all", limit=0):
     s = samples()
     model.eval()
-    entries = validation_entries(stage)[rank::world]
+    entries = validation_entries(stage)
+    entries = (entries[:: max(1, len(entries) // limit)][:limit] if limit else entries)[rank::world]
     withheld = withheld_gauges(fold)
     trained = s.gauges.trained & ~withheld
     results = {}
@@ -264,11 +284,13 @@ def validate(model, gpu, stage, fold, rank, world, arrays):
                         ok = b["nwm_valid"][FUTURE][[3, 11, 19]].T.bool()
                         reaches.add(out["reach"][:, FUTURE][:, [3, 11, 19]], target, ok)
             for name, sums in (("gauged", gauged), ("hidden", hidden)):
-                nse = sums.nse(min_count=30)[:, DAYS_1_5]
+                nse = sums.nse(min_count=2 if limit else 30)[:, DAYS_1_5]
                 results[name] = float(np.nanmean(np.nanmedian(nse[trained], axis=0)))
-            reach_nse = reaches.nse(min_count=30)
+            reach_nse = reaches.nse(min_count=2 if limit else 30)
             results["reaches"] = float(np.nanmean(np.nanmedian(reach_nse, axis=0)))
-            results["score"] = (results["gauged"] + results["hidden"] + results["reaches"]) / 3
+            results["score_all"] = selection_score(results, "all")
+            results["score_gauges"] = selection_score(results, "gauges")
+            results["score"] = selection_score(results, rule)
             if below[-1] > 0 or dist.is_initialized():
                 if dist.is_initialized():
                     dist.all_reduce(below)
@@ -299,7 +321,25 @@ def main():
     p.add_argument("--validate-every", type=int, default=1000)
     p.add_argument("--workers", type=int, default=5)
     p.add_argument("--seed", type=int, default=1)
+    # Attribution experiments (docs/ATTRIBUTION.md); the defaults reproduce the current model.
+    p.add_argument("--off", nargs="*", default=[], choices=ABLATIONS, help="Parts of the river-network design switched off")
+    p.add_argument("--lumped", action="store_true", help="Non-graph control: every reach a lumped basin (model.LumpedModel)")
+    p.add_argument("--lumped-reaches", type=int, default=0, help="Lumped model: train on this many random reaches per sample plus the gauges (0: all)")
+    p.add_argument("--no-nwm", action="store_true", help="No NWM anywhere: needs no --init, sets --nwm-weight 0 and --select gauges")
+    p.add_argument("--select", choices=["all", "gauges"], default="all", help="Checkpoint score (train.selection_score)")
+    p.add_argument("--scheme", choices=splits.SCHEMES, default="random", help="Held-out scheme of --fold (hydro.splits)")
+    p.add_argument("--keep", type=float, default=1.0, help="Share of the training gauges kept (gauge coverage)")
+    p.add_argument("--keep-seed", type=int, default=0, help="Draw of the kept gauges")
+    p.add_argument("--validation-limit", type=int, default=0, help="Validate on this many 2019 issues only (testing)")
     a = p.parse_args()
+    if a.no_nwm:
+        if a.init:
+            p.error("--no-nwm trains without stage A: drop --init")
+        if a.stage != "B":
+            p.error("--no-nwm is a stage-B setting")
+        a.nwm_weight, a.select = 0.0, "gauges"
+    if a.lumped and (a.off or a.trunk != "lstm"):
+        p.error("--lumped has no graph parts to switch off and uses the LSTM trunk")
     rank, world, local = (int(os.environ.get(k, d)) for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0)))
     device = torch.device(f"cuda:{local}")
     torch.cuda.set_device(device)
@@ -320,26 +360,42 @@ def train(a, rank, world, device):
         atomic_json(out / "arguments.json", {k: str(v) for k, v in vars(a).items()})
     s = samples()
     arrays = s.arrays
+    SPLIT.update(scheme=a.scheme, keep=a.keep, keep_seed=a.keep_seed)
+    if a.fold and not 1 <= a.fold <= splits.fold_count(a.scheme, s.gauges, s.network):
+        raise ValueError(f"--fold {a.fold} is not a fold of the {a.scheme} scheme")
     head = None
     if a.head == "lstm":  # 256 units, the LSTM baseline's log-flow scaling and its inputs (basin weather and attributes)
         head = dict(hidden=256, scale="z", lstm_inputs=True, flow_mean=float(arrays.mean[8]), flow_std=float(arrays.std[8]))
-    Model, extra = (AttentionGNN, dict(compile=True)) if a.trunk == "attention" else (HydroModel, {})
-    model = Model(s.network.groups, s.network.delay, hidden=a.hidden, quantiles=a.loss == "nse-q", head=head, **extra).to(device)
+    common = dict(hidden=a.hidden, quantiles=a.loss == "nse-q", head=head)
+    if a.lumped:
+        model = LumpedModel(s.network.groups, s.network.delay, **common)
+    elif a.trunk == "attention":
+        model = AttentionGNN(s.network.groups, s.network.delay, **common, compile=True)
+    else:
+        model = HydroModel(s.network.groups, s.network.delay, **common, off=a.off)
+    model = model.to(device)
     if a.init:  # stage A trains runoff and routing only; every head starts fresh
         state = torch.load(a.init, map_location="cpu", weights_only=False)
+        if bool(state["config"].get("kind") == "lumped") != a.lumped:
+            raise ValueError(f"{a.init} is {'not ' if a.lumped else ''}a lumped model")
         if a.whole:
             model.load_state_dict(state["model"])
         else:
             stage_a = ("trunk.", "simulation.", "router.")  # what stage A trains; heads start fresh
+            if "routing" in a.off:
+                stage_a = ("trunk.", "simulation.")  # the fixed kernels stay fixed
             model.load_state_dict({k: v for k, v in state["model"].items() if k.startswith(stage_a)}, strict=False)
     model.attach(s.network, s.network.edges, s.gauges.reach, device)
+    if rank == 0:
+        print(f"model: {type(model).__name__} {model.config.get('off', [])}, {model.parameter_count():,} trainable parameters; "
+              f"split {splits.describe(SPLIT)}, fold {a.fold}, {int(withheld_gauges(a.fold).sum())} gauges withheld", flush=True)
     gpu = Device(s.network, s.gauges, arrays, device)
     ddp = DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True) if world > 1 else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     per_rank = a.updates * a.accumulate
     entries = training_entries(per_rank * world, a.seed + 1000 * a.fold)[rank::world]
     loader = DataLoader(
-        Schedule(entries, a.fold, a.stage),
+        Schedule(entries, a.fold, a.stage, dict(SPLIT), a.lumped_reaches if a.lumped else 0),
         batch_size=None,
         shuffle=False,
         num_workers=a.workers,
@@ -362,8 +418,9 @@ def train(a, rank, world, device):
             context = ddp.no_sync() if (world > 1 and not sync) else torch.enable_grad()
             with context, torch.autocast("cuda", torch.bfloat16):
                 outputs = ddp(b)
+                rows = outputs.get("rows")  # lumped model on a reach subset: 0/1 weight of the reaches it ran on
                 if a.stage == "A":
-                    loss = nwm_loss(outputs["sim"], b, arrays, slice(None))
+                    loss = nwm_loss(outputs["sim"], b, arrays, slice(None), rows=rows)
                     parts = (0.0, loss.item(), 0.0)
                 else:
                     # The simulation head follows NWM everywhere. The observed head, which
@@ -371,10 +428,13 @@ def train(a, rank, world, device):
                     # visible gauges and at a tenth inside them, where the gauge should win.
                     inside = 1.0 - 0.9 * b["owned"]
                     everything = slice(None)
-                    prior = 0.5 * (
-                        nwm_loss(outputs["sim"], b, arrays, everything)
-                        + nwm_loss(outputs["observed"], b, arrays, everything, rows=inside)
-                    )
+                    if a.nwm_weight > 0:
+                        prior = 0.5 * (
+                            nwm_loss(outputs["sim"], b, arrays, everything, rows=rows)
+                            + nwm_loss(outputs["observed"], b, arrays, everything, rows=inside if rows is None else inside * rows)
+                        )
+                    else:  # no NWM: not even computed, so nothing of it reaches the gradient
+                        prior = outputs["sim"].sum() * 0
                     # Gauges: the forecast (gauge head where visible) and the routed observed
                     # head (the ungauged forecast) at every training gauge.
                     stay = outputs["delta"].pow(2).mean()
@@ -405,7 +465,7 @@ def train(a, rank, world, device):
         elif update % 50 == 0:
             running[:] = 0
         if update % a.validate_every == 0 or update == a.updates:
-            result = validate(model, gpu, a.stage, a.fold, rank, world, arrays)
+            result = validate(model, gpu, a.stage, a.fold, rank, world, arrays, a.select, a.validation_limit)
             if rank == 0:
                 result.update(update=update, minutes=(time.perf_counter() - began) / 60)
                 log.append(result)
@@ -416,10 +476,16 @@ def train(a, rank, world, device):
                     config=model.config,
                     stage=a.stage,
                     fold=a.fold,
+                    split=dict(SPLIT),
+                    nwm=a.nwm_weight > 0 or bool(a.init),
+                    select=a.select,
                     update=update,
                     validation=result,
+                    parameters=model.parameter_count(),
+                    gpus=world,
                 )
                 save_atomic(state, out / "last.pt")
+                save_atomic(state, out / f"checkpoint_{update:05d}.pt")  # every validation: selection can be redone
                 if result["score"] > best:
                     best = result["score"]
                     save_atomic(state, out / "best.pt")

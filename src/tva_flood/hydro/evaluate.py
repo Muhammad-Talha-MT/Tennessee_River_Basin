@@ -39,15 +39,15 @@ import torch
 import torch.distributed as dist
 
 from tva_flood.common import atomic_json
-from tva_flood.data.folds import holdout_folds
 from tva_flood.data.tva import basin_owner
 from tva_flood.evaluation.benchmark import climatology, load_nwm
 from tva_flood.evaluation.hydrology import Accumulator, reach_metrics
 
 from . import paths as P
+from . import splits
 from .data import timeline_index
 from .legacy import HydroModelV1
-from .model import AttentionGNN, HydroModel
+from .model import build_model
 from .samples import Device, Samples
 
 FUTURE = slice(P.INNOVATION, P.SCORED)
@@ -62,11 +62,11 @@ METRICS = ("nse", "kge", "r", "alpha", "beta", "rmse", "peak_error", "peak_error
 def load_model(path, s, device, legacy=False):
     state = torch.load(path, map_location="cpu", weights_only=False)
     c = state["config"]
-    extra = {k: c[k] for k in ("quantiles", "head") if k in c}
-    if c.get("kind") == "attention":
-        model = AttentionGNN(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **extra, **c["attention"])
+    if legacy:
+        extra = {k: c[k] for k in ("quantiles", "head") if k in c}
+        model = HydroModelV1(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **extra)
     else:
-        model = (HydroModelV1 if legacy else HydroModel)(c["groups"], c["delay"], c["hidden"], c["channels"], c["graph_layers"], **extra)
+        model = build_model(c)
     model.load_state_dict(state["model"])
     model.to(device).eval()
     model.attach(s.network, s.network.edges, s.gauges.reach, device)
@@ -117,9 +117,9 @@ def test_issues(s, nwm, reach_days, limit=0):
     return issues, every_reach
 
 
-def reach_folds(s):
-    """Fold of the gauge whose basin holds each reach (-1: none) and of each gauge."""
-    gauge_fold = holdout_folds(P.ROOT, s.gauges.catalog, FOLDS)
+def reach_folds(s, scheme="random"):
+    """Fold of the gauge whose basin holds each reach (-1: none) and of each gauge, under ``scheme``."""
+    gauge_fold = splits.gauge_folds(scheme, s.gauges, s.network)
     owner, _ = basin_owner(s.network.edges, s.network.n, s.gauges.reach)
     return np.where(owner >= 0, gauge_fold[np.maximum(owner, 0)], -1), gauge_fold
 
@@ -169,6 +169,13 @@ def main():
     p.add_argument("--label", default="new model", help="Name of the scored model in the report")
     p.add_argument("--min-count", type=int, default=100)
     p.add_argument("--limit", type=int, default=0, help="First n issues only (testing)")
+    p.add_argument("--lstm-benchmark", default=str(P.MODELS / "gefs_benchmark{suffix}"),
+                   help="LSTM forecasts at the gauges (evaluate-benchmark): {suffix} is '' (all gauges) or _f<k>")
+    p.add_argument("--rains", nargs="+", choices=["gefs", "aorc"], default=["gefs", "aorc"],
+                   help="Forecast rain sources scored (aorc: the realized-rain diagnostic)")
+    p.add_argument("--no-reaches", action="store_true", help="Skip the every-reach protocol (gauges only, faster)")
+    p.add_argument("--any-fold", action="store_true",
+                   help="Accept fold models whose checkpoint names another fold (a stage-A model used for every fold)")
     a = p.parse_args()
     rank, world, local = (int(os.environ.get(k, d)) for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0)))
     device = torch.device(f"cuda:{local}")
@@ -190,13 +197,25 @@ def evaluate(a, rank, world, device):
         out.mkdir(parents=True, exist_ok=True)
     gpu = Device(network, gauges, arrays, device)
     models = {0: load_model(a.model, s, device, a.legacy)[0]}
-    for k in range(1, FOLDS + 1):
+    fold_states = {}
+    first = torch.load(Path(a.fold_models.format(k=1)), map_location="cpu", weights_only=False)
+    scheme = (first.get("split") or {}).get("scheme", "random")
+    a.scheme = scheme
+    for k in range(1, splits.fold_count(scheme, gauges, network) + 1):
         model, state = load_model(Path(a.fold_models.format(k=k)), s, device, a.legacy)
-        if state["fold"] != k:
+        if state["fold"] != k and not a.any_fold:
             raise ValueError(f"Fold model {k} was trained with fold {state['fold']} withheld")
-        models[k] = model
-    reach_fold, gauge_fold = reach_folds(s)
-    withheld = {k: gauge_fold == k if k else np.zeros(gauges.count, bool) for k in models}
+        if (state.get("split") or {}).get("scheme", "random") != scheme:
+            raise ValueError("Fold models use different held-out schemes")
+        models[k], fold_states[k] = model, state
+    reach_fold, gauge_fold = reach_folds(s, scheme)
+    withheld = {0: np.zeros(gauges.count, bool)}
+    for k, state in fold_states.items():  # what each fold model never saw (fold gauges, and gauges dropped by --keep)
+        split = state.get("split") or {}
+        withheld[k] = splits.withheld(gauges, network, k, scheme, split.get("keep", 1.0), split.get("keep_seed", 0))
+        if split.get("keep", 1.0) <= 0:
+            withheld[k] = np.ones(gauges.count, bool)
+    a.split = (fold_states[1].get("split") or dict(scheme=scheme))
     reach_model = torch.as_tensor(np.maximum(reach_fold, 0), device=device)
     sites = torch.as_tensor(gauges.camelsh, device=device)
 
@@ -207,15 +226,19 @@ def evaluate(a, rank, world, device):
     clim = climatology(gauges.catalog, P.TRAIN_UNTIL)
     times = arrays.times
     issues, every_reach = test_issues(s, nwm, reach_nwm.days(), a.limit)
+    if a.no_reaches:
+        every_reach = set()
     mine = issues[rank::world]
 
     g = gauges.count
-    gauged_names = ["hydro+gefs", "hydro+aorc", "nwm", "persistence", "climatology"]
-    ungauged_names = ["hydro+gefs", "hydro+aorc", "nwm", "persistence", "climatology"]
+    hydro_names = [f"hydro+{r}" for r in a.rains]
+    gauged_names = hydro_names + ["nwm", "persistence", "climatology"]
+    ungauged_names = hydro_names + ["nwm", "persistence", "climatology"]
+    a.gauged_names, a.ungauged_names = gauged_names, [n.replace("hydro", "ungauged") for n in hydro_names]
     acc = dict(
         gauged={m: Accumulator(g, device) for m in gauged_names},
         ungauged={m: Accumulator(g, device) for m in ungauged_names},
-        reach={m: Accumulator(network.n, device) for m in ["hydro+gefs", "hydro+aorc", "retro_persistence"]},
+        reach={m: Accumulator(network.n, device) for m in hydro_names + ["retro_persistence"]},
     )
     kept = dict(gauged=[], ungauged=[])
     began = time.perf_counter()
@@ -236,7 +259,7 @@ def evaluate(a, rank, world, device):
                 climatology=torch.as_tensor(np.nan_to_num(clim[ahead.dayofyear, ahead.hour // 6]), device=device),
             )
             base = gpu.limit_rain(gpu.batch(s.build(step, "aorc")), a.rain_steps)
-            rains = {"gefs": s.rain.get("gefs", day), "aorc": "aorc"}
+            rains = {r: (s.rain.get("gefs", day) if r == "gefs" else "aorc") for r in a.rains}
             full = step in every_reach
             if full:
                 retro = torch.as_tensor(arrays.flow_raw(base["nwm"][FUTURE].cpu().numpy()), device=device)
@@ -255,7 +278,7 @@ def evaluate(a, rank, world, device):
                     if k == 0:
                         values[f"hydro+{tag}"] = flow
                     else:
-                        held = torch.as_tensor(withheld[k], device=device)
+                        held = torch.as_tensor(gauge_fold == k, device=device)  # scored: this fold's gauges only
                         prior = values.get(f"ungauged+{tag}", torch.zeros_like(flow))
                         values[f"ungauged+{tag}"] = torch.where(held[None], flow, prior)
                     if full:
@@ -270,13 +293,11 @@ def evaluate(a, rank, world, device):
                 value = values[name.replace("hydro", "ungauged")] if name.startswith("hydro") else refs[name]
                 acc["ungauged"][name].add(value, truth0, fold_mask)
             kept["gauged"].append(_keep(step, truth, mask, [values.get(n, refs.get(n)) for n in gauged_names]))
-            kept["ungauged"].append(
-                _keep(step, truth, fold_mask, [values["ungauged+gefs"], values["ungauged+aorc"]])
-            )
+            kept["ungauged"].append(_keep(step, truth, fold_mask, [values[n] for n in a.ungauged_names]))
             if full:
                 retro0 = torch.nan_to_num(retro).double()
-                acc["reach"]["hydro+gefs"].add(composite["gefs"], retro0, reach_mask)
-                acc["reach"]["hydro+aorc"].add(composite["aorc"], retro0, reach_mask)
+                for tag in rains:
+                    acc["reach"][f"hydro+{tag}"].add(composite[tag], retro0, reach_mask)
                 last_retro = torch.as_tensor(arrays.flow_raw(base["nwm"][P.INNOVATION - 1].cpu().numpy()), device=device)
                 acc["reach"]["retro_persistence"].add(last_retro[None].expand(P.HORIZON, -1).double(), retro0, reach_mask)
             if rank == 0 and position % 25 == 0:
@@ -386,6 +407,7 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
             truth=np.concatenate([q["truth"] for q in parts])[order],
             values=np.concatenate([q["values"] for q in parts])[order],
             stations=gauges.names,
+            methods=np.array(a.gauged_names if name == "gauged" else a.ungauged_names),
         )
         for r in range(world):
             (out / f".{name}_{r}.npz").unlink()
@@ -394,20 +416,18 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
         f"# Distributed model: three test protocols ({len(issues)} 00Z issues, {first:%Y-%m-%d} to {final:%Y-%m-%d})",
         "",
         f"Every forecast uses GEFSv12 operational rain to {a.rain_steps * 6} h; +aorc is the realized-rain diagnostic.",
+        f"Held-out split of the fold models: {splits.describe(a.split)}.",
         "",
     ]
+    lstm_path = lambda suffix: Path(a.lstm_benchmark.format(suffix=suffix)) / "forecasts.npz"  # noqa: E731
     # 1. Gauged --------------------------------------------------------------------------
     mine = gauge_table(acc["gauged"], a.min_count)
-    old = saved_nse(
-        P.MODELS / "gefs_benchmark/forecasts.npz",
-        [f"lstm+{r}" for r in ("gefs", "aorc")],
-        issues,
-        times,
-        a.min_count,
-    )
+    old = {}
+    if lstm_path("").exists():
+        old = saved_nse(lstm_path(""), [f"lstm+{r}" for r in a.rains], issues, times, a.min_count)
     names = list(gauges.names)
     rows = header("method (gauged, median NSE over gauges)")
-    for rain in ("gefs", "aorc"):
+    for rain in a.rains:
         nse, scored = mine[f"hydro+{rain}"]
         rows.append(row(f"**{a.label}**+{rain}", medians(nse, scored)))
         for label, prefix in BASELINES:
@@ -426,32 +446,28 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     # 2. Ungauged ------------------------------------------------------------------------
     mine_u = gauge_table(acc["ungauged"], a.min_count)
     rows = header("method (ungauged, held-out gauges)")
-    for name in ("hydro+gefs", "hydro+aorc"):
+    for name in [f"hydro+{r}" for r in a.rains]:
         nse, scored = mine_u[name]
         rows.append(row(f"**{a.label}**{name[5:]}", medians(nse, scored)))
     old_u = {}
-    for k in range(1, FOLDS + 1):
-        part = saved_nse(
-            P.MODELS / f"gefs_benchmark_f{k}/forecasts.npz",
-            [f"lstm+{r}" for r in ("gefs", "aorc")],
-            issues,
-            times,
-            a.min_count,
-        )
+    for k in range(1, (FOLDS if a.scheme == "random" else 0) + 1):  # the LSTM folds are the random folds
+        if not lstm_path(f"_f{k}").exists():
+            continue
+        part = saved_nse(lstm_path(f"_f{k}"), [f"lstm+{r}" for r in a.rains], issues, times, a.min_count)
         for method, (nse, stations) in part.items():
             full = old_u.setdefault(method, np.full((P.HORIZON, gauges.count), np.nan))
             index = pd.Index(names).get_indexer(stations)
             full[:, index] = np.where(np.isfinite(nse), nse, full[:, index])
-    held = holdout_folds(P.ROOT, gauges.catalog, FOLDS) > 0
+    held = splits.gauge_folds(a.scheme, gauges, network) > 0
     for label, prefix in BASELINES:
-        for rain in ("gefs", "aorc"):
+        for rain in a.rains:
             if f"{prefix}+{rain}" in old_u:
                 rows.append(row(f"{label}, ungauged+{rain}", medians(old_u[f"{prefix}+{rain}"][:, held])))
     for name in ("nwm", "persistence", "climatology"):
         nse, scored = mine_u[name]
         rows.append(row(f"{name} (reference: may use these gauges)", medians(nse, scored)))
     count = int(np.isfinite(np.where(mine_u["hydro+gefs"][1], mine_u["hydro+gefs"][0], np.nan)[3]).sum())
-    lines += ["", f"## 2. Ungauged: {count} held-out gauges (5 folds) against USGS", ""] + rows
+    lines += ["", f"## 2. Ungauged: {count} held-out gauges ({len(set(np.unique(reach_fold)) - {-1, 0})} {a.scheme} folds) against USGS", ""] + rows
     # By dams ----------------------------------------------------------------------------
     regulated, groups = regulation(network, gauges)
     lines += ["", "By dams (days 1-5, GEFS rain):", "", f"| protocol | gauges | {a.label} | LSTM | NWM |", "|---|---|---:|---:|---:|"]
@@ -471,15 +487,20 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     pd.DataFrame(
         [dict(method=n, lead_h=h, station=st, nse=nse[h // 6 - 1, i]) for n, (nse, _) in mine_u.items() for h in LEADS for i, st in enumerate(names)]
     ).to_csv(out / "ungauged.csv", index=False)
+    if a.no_reaches:
+        report = "\n".join(lines + ["", "Every-reach protocol skipped (--no-reaches)."]) + "\n"
+        (out / "report.md").write_text(report)
+        atomic_json(out / "manifest.json", dict(model=str(a.model), fold_models=a.fold_models, issues=len(issues), every_reach_issues=0,
+                                                min_count=a.min_count, rains=a.rains, split=a.split, lstm_benchmark=a.lstm_benchmark))
+        print(report, flush=True)
+        print(f"EVALUATION COMPLETE: {out}", flush=True)
+        return
     # 3. Every reach ---------------------------------------------------------------------
     metrics = {n: reach_metrics(**acc_.numpy(), min_count=a.min_count) for n, acc_ in acc["reach"].items()}
     nwm_ref = np.load(P.MODELS / "retrospective_comparison_gefs_nwm/metrics.npz")
     if not a.limit and int(nwm_ref["issues"]) != len(every_reach):
         raise ValueError(f"NWM every-reach reference: {int(nwm_ref['issues'])} issues, not {len(every_reach)}")
-    series = {
-        f"{a.label}+gefs": metrics["hydro+gefs"]["nse"],
-        f"{a.label}+aorc": metrics["hydro+aorc"]["nse"],
-    }
+    series = {f"{a.label}+{r}": metrics[f"hydro+{r}"]["nse"] for r in a.rains}
     lstm = P.MODELS / "gefs_lstm_reaches/metrics.npz"  # lstm_every_reach.py
     if lstm.exists():
         saved = np.load(lstm)
@@ -493,7 +514,7 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     table, rows = reach_table(series, reach_fold, network, regulated)
     table.to_csv(out / "reaches.csv", index=False)
     lines += ["", f"## 3. Every reach against the NWM v3.0 retrospective ({len(every_reach)} issues to 2023-01-20)", ""] + rows
-    full = {f"{a.label}+{t}/{k}": metrics[f"hydro+{t}"][k] for t in ("gefs", "aorc") for k in METRICS}
+    full = {f"{a.label}+{t}/{k}": metrics[f"hydro+{t}"][k] for t in a.rains for k in METRICS}
     if lstm.exists():
         full.update({f"LSTM, tuned+{t}/{k}": saved[f"{k}/{t}"] for t in ("gefs", "aorc") for k in METRICS if f"{k}/{t}" in saved})
     full.update({f"NWM forecast/{k}": nwm_ref[f"reach/nwm_forecast/{k}"] for k in METRICS if f"reach/nwm_forecast/{k}" in nwm_ref})
@@ -502,7 +523,8 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     lines += ["", "Median NSE per lead (six-hour means). Days 1-5: mean of the medians at 24-120 h."]
     report = "\n".join(lines) + "\n"
     (out / "report.md").write_text(report)
-    atomic_json(out / "manifest.json", dict(model=str(a.model), fold_models=a.fold_models, issues=len(issues), every_reach_issues=len(every_reach), min_count=a.min_count))
+    atomic_json(out / "manifest.json", dict(model=str(a.model), fold_models=a.fold_models, issues=len(issues), every_reach_issues=len(every_reach),
+                                            min_count=a.min_count, rains=a.rains, split=a.split, lstm_benchmark=a.lstm_benchmark))
     print(report, flush=True)
     print(f"EVALUATION COMPLETE: {out}", flush=True)
 

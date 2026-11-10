@@ -94,22 +94,29 @@ class RiverGraph:
 
 
 class GraphBlock(nn.Module):
-    """h + MLP([h, mean of upstream h, mean of downstream h]) at every step, on [n, F, C]."""
+    """h + MLP([h, mean of upstream h, mean of downstream h]) at every step, on [n, F, C].
 
-    def __init__(self, channels):
+    ``mixing=False`` (ablation): the neighbour means are zeros, so each reach is updated from its
+    own state only, with the same parameters (no message passing)."""
+
+    def __init__(self, channels, mixing=True):
         super().__init__()
         self.norm = nn.LayerNorm(channels)
         self.mix = mlp(3 * channels, channels, channels)
+        self.mixing = mixing
 
     def forward(self, h, graph):
         x = self.norm(h)
-        return h + self.mix(torch.cat([x, graph.upstream(x), graph.downstream(x)], dim=-1))
+        if self.mixing:
+            return h + self.mix(torch.cat([x, graph.upstream(x), graph.downstream(x)], dim=-1))
+        zero = torch.zeros_like(x)
+        return h + self.mix(torch.cat([x, zero, zero], dim=-1))
 
 
 class Trunk(nn.Module):
     """Reach states [n, F, channels] from step inputs [n, T, STEP_INPUTS] and reach inputs."""
 
-    def __init__(self, hidden, channels, graph_layers, chunk=15000):
+    def __init__(self, hidden, channels, graph_layers, chunk=15000, mixing=True):
         super().__init__()
         self.inputs = nn.Linear(STEP_INPUTS, hidden)
         self.reach = mlp(REACH_INPUTS, hidden, hidden)
@@ -117,7 +124,7 @@ class Trunk(nn.Module):
         with torch.no_grad():  # forget gate open at the start: long storage memory
             self.lstm.bias_hh_l0[hidden : 2 * hidden] = 3.0
         self.down = nn.Linear(hidden, channels)
-        self.blocks = nn.ModuleList(GraphBlock(channels) for _ in range(graph_layers))
+        self.blocks = nn.ModuleList(GraphBlock(channels, mixing) for _ in range(graph_layers))
         self.chunk = chunk
 
     def _time(self, steps, reach):
@@ -186,13 +193,21 @@ class AttentionTrunk(nn.Module):
 
 
 class Router(nn.Module):
-    """Mass-conserving routing of lateral inflow with one travel-time kernel per group."""
+    """Mass-conserving routing of lateral inflow with one travel-time kernel per group.
 
-    def __init__(self, groups, delay):
+    ``learned=False`` (ablation): every kernel is fixed to all weight on the first tap, so the
+    flow at a reach is the instantaneous sum of its basin's lateral inflow (mass is still
+    conserved, but no travel time)."""
+
+    def __init__(self, groups, delay, learned=True):
         super().__init__()
         taps = torch.arange(P.ROUTE, dtype=torch.float32)
         center = torch.as_tensor(delay, dtype=torch.float32).clamp(max=P.ROUTE - 1)[:, None]
-        self.logits = nn.Parameter(-((torch.log1p(taps)[None] - torch.log1p(center)) ** 2) / (2 * 0.35**2))
+        logits = -((torch.log1p(taps)[None] - torch.log1p(center)) ** 2) / (2 * 0.35**2)
+        if not learned:
+            logits = torch.full_like(logits, -1e4)
+            logits[:, 0] = 0.0
+        self.logits = nn.Parameter(logits, requires_grad=learned)
         self.groups = groups
 
     def attach(self, network, gauge_reaches, device):
@@ -294,13 +309,24 @@ class GaugeHead(nn.Module):
 QUANTILES = (0.5, 0.9, 0.99)  # flow quantiles of the tail head (``quantiles=True``)
 
 
+ABLATIONS = ("mixing", "broadcast", "routing")  # parts of the river-network design that can be switched off
+
+
 class HydroModel(nn.Module):
     """``quantiles=True`` replaces the spread head by a tail head: the 0.5, 0.9 and 0.99 quantiles of
     the flow at every gauge and lead, each the forecast (detached, so the tail loss never moves the
-    mean) times exp of a non-decreasing offset."""
+    mean) times exp of a non-decreasing offset.
 
-    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False, head=None):
+    ``off`` (ablations; recorded in the config only when used): parts switched off. "mixing": the
+    graph layers see no neighbours (no message passing); "broadcast": no reach sees the specific
+    discharge of the visible gauge owning its basin (nor its area ratio to it); "routing": the
+    learned travel-time kernels become a fixed instantaneous sum over the basin."""
+
+    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False, head=None, off=()):
         super().__init__()
+        off = tuple(sorted(set(off)))
+        if set(off) - set(ABLATIONS):
+            raise ValueError(f"Unknown ablations {set(off) - set(ABLATIONS)}")
         self.config = dict(
             groups=groups,
             delay=[float(d) for d in delay],
@@ -312,12 +338,15 @@ class HydroModel(nn.Module):
             self.config["quantiles"] = True
         if head:
             self.config["head"] = head  # GaugeHead settings
-        self.trunk = Trunk(hidden, channels, graph_layers)
+        if off:
+            self.config["off"] = list(off)
+        self.off = set(off)
+        self.trunk = Trunk(hidden, channels, graph_layers, mixing="mixing" not in self.off)
         self.simulation = nn.Linear(channels, 1)
         self.observed = nn.Linear(channels, 1)
         nn.init.zeros_(self.observed.weight)
         nn.init.zeros_(self.observed.bias)
-        self.router = Router(groups, delay)
+        self.router = Router(groups, delay, learned="routing" not in self.off)
         self.head = GaugeHead(**(head or {}))
         self.lead = nn.Embedding(P.HORIZON, 16)
         if quantiles:
@@ -361,6 +390,29 @@ class HydroModel(nn.Module):
         offset = torch.cumsum(torch.cat([raw[..., :1], F.softplus(raw[..., 1:])], dim=-1), dim=-1)
         return mean[..., None].float() * torch.exp(offset.clamp(max=6.0))
 
+    def network_flows(self, b):
+        """Flows over the inflow window [n or G, F]: ``sim`` (simulation head) and ``observed`` (observed head)
+        routed at every reach, ``gauge`` the observed head at every gauge, and ``delta`` [n, F]."""
+        h = self.trunk(b["steps"], b["reach"], self.graph)
+        inflow = (0.5 * F.softplus(self.simulation(h).float()[..., 0])) * b["area"][:, None] / 21.6
+        delta = 2 * torch.tanh(self.observed(h).float()[..., 0])
+        q = inflow * torch.exp(delta)
+        return dict(sim=self.router(inflow), observed=self.router(q), gauge=self.router(q, gauges_only=True), delta=delta)
+
+    def without_broadcast(self, b):
+        """Batch ``b`` with the owner-gauge inputs (``samples.Device.assemble``: the last two step channels, the
+        owner's specific discharge and its validity, and the last two reach inputs, area ratio and flag) zeroed
+        when "broadcast" is off; unchanged otherwise. Each gauge's own history at its own reach stays."""
+        if "broadcast" not in getattr(self, "off", ()):
+            return b
+        steps, reach = b["steps"].clone(), b["reach"].clone()
+        steps[..., -2:] = 0
+        reach[..., -2:] = 0
+        return dict(b, steps=steps, reach=reach)
+
+    def parameter_count(self):
+        return int(sum(p.numel() for p in self.parameters() if p.requires_grad))
+
     def gauge_rain(self, b):
         """Basin-mean forecast rain and whether it is known at every gauge [G, lead, 2]."""
         future = slice(P.HISTORY, P.WINDOW)
@@ -387,13 +439,13 @@ class HydroModel(nn.Module):
         ``full`` also ``reach`` [n, S]: ``observed`` with the gauge rows of ``gauge``.
         """
         scored = slice(P.FLOW_STEPS - P.SCORED, P.FLOW_STEPS)
-        h = self.trunk(b["steps"], b["reach"], self.graph)
-        inflow = (0.5 * F.softplus(self.simulation(h).float()[..., 0])) * b["area"][:, None] / 21.6
-        delta = 2 * torch.tanh(self.observed(h).float()[..., 0])
-        q = inflow * torch.exp(delta)
-        out = dict(sim=self.router(inflow)[:, scored], delta=delta)
-        out["observed"] = self.router(q)[:, scored]  # observed head at every reach
-        routed = self.router(q, gauges_only=True)[:, scored]
+        b = self.without_broadcast(b)
+        flows = self.network_flows(b)
+        out = dict(sim=flows["sim"][:, scored], delta=flows["delta"])
+        out["observed"] = flows["observed"][:, scored]  # observed head at every reach
+        if "rows" in flows:
+            out["rows"] = flows["rows"]
+        routed = flows["gauge"][:, scored]
         visible, reach = b["visible"], b["gauge_reach"]
         out["routed_gauge"] = routed  # observed head at every gauge, without its own history
         gauge = routed
@@ -445,3 +497,99 @@ class AttentionGNN(HydroModel):
         super().__init__(groups, delay, hidden, channels, graph_layers, quantiles, head)
         self.trunk = AttentionTrunk(hidden, channels, graph_layers, heads, layers, compile=compile)
         self.config.update(kind="attention", attention=dict(heads=heads, layers=layers))
+
+
+class LumpedModel(HydroModel):
+    """Non-graph control (experiment A5/A6): the same per-reach LSTM, heads, losses and gauge head as ``HydroModel``,
+    but every reach is a lumped basin, as in the LSTM baseline. Its weather and attributes are means over its whole
+    upstream basin (area-weighted), it forecasts its outlet flow directly (runoff depth x basin area, no routing),
+    and no reach sees any other reach: no graph layers, no owner-gauge broadcast. A gauge's own flow history still
+    enters at its own reach. Trained on the NWM retrospective at every reach (stage A) like the graph model, so the
+    two differ only in the river network.
+
+    ``b["rows"]`` (optional, a LongTensor of reaches, gauges included) runs the model on those reaches only (a
+    training subset); outputs are then zero elsewhere and ``rows`` is returned as a 0/1 weight for the losses.
+    """
+
+    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=0, quantiles=False, head=None, off=()):
+        super().__init__(groups, delay, hidden, channels, 0, quantiles, head, off=("broadcast",))
+        self.config.update(kind="lumped")
+        del self.router  # never used: flows are not routed
+
+    def attach(self, network, edges, gauge_reaches, device):
+        self.graph = RiverGraph(edges, network.n, device)
+        rows = np.repeat(np.arange(network.n), np.diff(network.indptr))
+        weight = network.share * network.area[network.members]
+        weight = weight / np.maximum(np.bincount(rows, weights=weight, minlength=network.n), 1e-9)[rows]
+        self.basin_all = csr(rows, network.members, weight, (network.n, network.n), device)[0]
+        self.indptr = torch.as_tensor(network.indptr, dtype=torch.long, device=device)
+        self.members = torch.as_tensor(network.members, dtype=torch.long, device=device)
+        self.weights = torch.as_tensor(weight, dtype=torch.float32, device=device)
+        self.n = network.n
+        position = np.full(network.n, -1)
+        position[gauge_reaches] = np.arange(len(gauge_reaches))
+        keep = position[rows] >= 0
+        g = len(gauge_reaches)
+        self.basin_mean = csr(position[rows[keep]], network.members[keep], weight[keep], (g, network.n), device)
+        group = network.group[keep]
+        lake = (group % 3) > 0
+        share = np.bincount(position[rows[keep]], weights=weight[keep] * lake, minlength=g)
+        self.lake_share = torch.as_tensor(share, dtype=torch.float32, device=device)
+        self.gauge_reach = torch.as_tensor(gauge_reaches, dtype=torch.long, device=device)
+
+    @torch.autocast("cuda", enabled=False)
+    def basin_average(self, x, rows=None):
+        """Basin means [R, ...] of reach values ``x`` [n, ...] (no gradient: inputs only)."""
+        flat = x.float().reshape(x.shape[0], -1).contiguous()
+        if rows is None:
+            out = self.basin_all @ flat
+        else:
+            start, stop = self.indptr[rows], self.indptr[rows + 1]
+            length = stop - start
+            row = torch.repeat_interleave(torch.arange(len(rows), device=x.device), length)
+            first = torch.repeat_interleave(start - torch.cumsum(length, 0) + length, length)
+            index = first + torch.arange(int(length.sum()), device=x.device)
+            a = torch.sparse_coo_tensor(
+                torch.stack([row, self.members[index]]), self.weights[index], (len(rows), self.n)
+            ).to_sparse_csr()
+            out = a @ flat
+        return out.view(-1, *x.shape[1:])
+
+    def network_flows(self, b):
+        n = b["steps"].shape[0]
+        rows = b.get("rows")
+        with torch.no_grad():
+            weather = self.basin_average(b["steps"][..., :16], rows)  # weather and validity
+            statics = self.basin_average(b["reach"][:, : 48 + 7], rows)  # attributes and antecedent storage
+        pick = slice(None) if rows is None else rows
+        steps = torch.cat([weather.to(b["steps"].dtype), b["steps"][pick, :, 16:]], dim=-1)
+        reach = torch.cat([statics.to(b["reach"].dtype), b["reach"][pick, 48 + 7 :]], dim=-1)
+        h = self.trunk(steps, reach, self.graph)
+        flow = (0.5 * F.softplus(self.simulation(h).float()[..., 0])) * b["basin_area"][pick][:, None] / 21.6
+        delta = 2 * torch.tanh(self.observed(h).float()[..., 0])
+        observed = flow * torch.exp(delta)
+        if rows is None:
+            out = dict(sim=flow, observed=observed, delta=delta)
+        else:
+            out = {}
+            for key, value in (("sim", flow), ("observed", observed), ("delta", delta)):
+                full = torch.zeros(n, value.shape[1], dtype=value.dtype, device=value.device)
+                full[rows] = value
+                out[key] = full
+            mask = torch.zeros(n, device=flow.device)
+            mask[rows] = 1.0
+            out["rows"] = mask
+        out["gauge"] = out["observed"][b["gauge_reach"]]
+        return out
+
+
+def build_model(config, **extra):
+    """A model from a checkpoint config (``HydroModel``, ``AttentionGNN`` or ``LumpedModel``)."""
+    kwargs = {k: config[k] for k in ("quantiles", "head") if k in config}
+    args = (config["groups"], config["delay"], config["hidden"], config["channels"], config["graph_layers"])
+    kind = config.get("kind")
+    if kind == "attention":
+        return AttentionGNN(*args, **kwargs, **config["attention"], **extra)
+    if kind == "lumped":
+        return LumpedModel(*args, **kwargs)
+    return HydroModel(*args, **kwargs, off=config.get("off", ()))

@@ -107,6 +107,8 @@ class Device:
         b["valid"] = move(s["valid"]).permute(1, 0, 2).float()
         for key in ("season", "antecedent", "nwm", "nwm_valid", "observed", "visible", "owner"):
             b[key] = move(s[key])
+        if "rows" in s:  # reach subset of a lumped-model training sample
+            b["rows"] = move(s["rows"]).long()
         return self.assemble(b)
 
     def assemble(self, b):

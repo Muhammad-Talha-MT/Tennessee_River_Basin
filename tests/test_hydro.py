@@ -121,3 +121,32 @@ def test_attention_model_config_round_trips():
     model = AttentionGNN([0.0] * 3, np.zeros(3), hidden=16, channels=8, graph_layers=1, heads=2, layers=1)
     assert model.config["kind"] == "attention" and model.config["attention"] == dict(heads=2, layers=1)
     assert not hasattr(model.trunk, "lstm") and hasattr(model.trunk, "layers")
+
+
+def test_instant_routing_conserves_mass_without_delay():
+    from tva_flood.hydro.model import Router as R
+
+    net = network()
+    r = R(2, np.array([0.0, 3.0]), learned=False)
+    r.attach(net, np.array([3, 4]), torch.device("cpu"))
+    q = torch.zeros(5, 20)
+    q[0, 2] = 1.0  # one pulse at the top of the river
+    out = r(q)
+    assert not r.logits.requires_grad
+    assert torch.allclose(out[4], out[4].clamp_min(0))
+    assert int(out[4].argmax()) == 2  # arrives at the outlet in the same step
+    assert torch.isclose(out[4].sum(), torch.tensor(1.0), atol=1e-5)
+
+
+def test_graph_block_without_mixing_ignores_neighbours():
+    from tva_flood.hydro.model import GraphBlock
+
+    torch.manual_seed(0)
+    graph = RiverGraph(EDGES, 5, torch.device("cpu"))
+    block = GraphBlock(4, mixing=False)
+    h = torch.randn(5, 3, 4)
+    changed = h.clone()
+    changed[0] += 3 * torch.randn(3, 4)  # an upstream neighbour of reach 1 changes (not a constant: LayerNorm removes it)
+    assert torch.allclose(block(h, graph)[1], block(changed, graph)[1])
+    block.mixing = True
+    assert not torch.allclose(block(h, graph)[1], block(changed, graph)[1])

@@ -39,6 +39,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -331,6 +332,9 @@ def main():
     p.add_argument("--keep", type=float, default=1.0, help="Share of the training gauges kept (gauge coverage)")
     p.add_argument("--keep-seed", type=int, default=0, help="Draw of the kept gauges")
     p.add_argument("--validation-limit", type=int, default=0, help="Validate on this many 2019 issues only (testing)")
+    p.add_argument("--resume", action="store_true", help="Continue from OUT/resume.pt if it exists (a cut-off run); otherwise start fresh")
+    p.add_argument("--checkpoint-every", type=int, default=100, help="Save OUT/resume.pt (model, optimizer, progress) every this many updates")
+    p.add_argument("--stop-after", type=int, default=0, help="Exit with code 2 after this update (testing the resume)")
     a = p.parse_args()
     if a.no_nwm:
         if a.init:
@@ -406,9 +410,31 @@ def train(a, rank, world, device):
     withheld = torch.as_tensor(withheld_gauges(a.fold), device=device)
     trained = torch.as_tensor(s.gauges.trained, device=device) & ~withheld
     best, began, log = -math.inf, time.perf_counter(), []
+    first = 1
+    resume_file = out / "resume.pt"
+    if a.resume and resume_file.exists():
+        saved = torch.load(resume_file, map_location="cpu", weights_only=False)
+        if saved["updates"] != a.updates or saved["accumulate"] != a.accumulate or saved["seed"] != a.seed:
+            raise ValueError(f"{resume_file} belongs to another run (updates, accumulate or seed differ)")
+        model.load_state_dict(saved["model"])
+        optimizer.load_state_dict(saved["optimizer"])
+        best, log, first = saved["best"], saved["log"], saved["update"] + 1
+        began = time.perf_counter() - (log[-1]["minutes"] * 60 if log else 0)  # minutes continue from the first part
+        loader = DataLoader(
+            Schedule(entries[saved["update"] * a.accumulate :], a.fold, a.stage, dict(SPLIT), a.lumped_reaches if a.lumped else 0),
+            batch_size=None, shuffle=False, num_workers=a.workers, pin_memory=True, prefetch_factor=2, persistent_workers=True,
+        )
+        if rank == 0:
+            print(f"resumed at update {saved['update']} of {a.updates} (best score {best:.4f})", flush=True)
     running = np.zeros(4)
     iterator = iter(loader)
-    for update in range(1, a.updates + 1):
+
+    def save_resume(update):  # rank 0 only
+        state = dict(model=model.state_dict(), optimizer=optimizer.state_dict(), update=update, best=best, log=log,
+                     updates=a.updates, accumulate=a.accumulate, seed=a.seed)
+        save_atomic(state, resume_file)
+
+    for update in range(first, a.updates + 1):
         lr = a.lr * min(1.0, update / a.warmup) * 0.5 * (1 + math.cos(math.pi * update / a.updates))
         for group in optimizer.param_groups:
             group["lr"] = max(lr, a.lr * 0.01)
@@ -491,6 +517,15 @@ def train(a, rank, world, device):
                     save_atomic(state, out / "best.pt")
             if world > 1:
                 dist.barrier()
+        if update % a.checkpoint_every == 0 and update < a.updates and rank == 0:
+            save_resume(update)
+        elif update % a.validate_every == 0 and rank == 0:
+            save_resume(update)
+        if a.stop_after and update == a.stop_after:
+            if rank == 0:
+                save_resume(update)
+                print(f"stopped after update {update} (--stop-after)", flush=True)
+            sys.exit(2)
     if rank == 0:
         print(f"TRAINING COMPLETE: {out} (best score {best:.4f})", flush=True)
 

@@ -30,11 +30,12 @@ PHASE=${1:?phase: phase0, phase1, seeds, phase2, extra or report}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 export PYTHONPATH=$REPO/src OMP_NUM_THREADS=4
-ROOT=/data/tva_data
+ROOT=${TVA_ROOT:-/data/tva_data}   # the data root (on Frontier: /lustre/orion/geo173/proj-shared/tva_data)
+export TVA_ROOT=$ROOT
 M=$ROOT/models
 A=$M/attr
 LOGS=$ROOT/logs/attr
-PY=$ROOT/conda_envs/tva_gnn/bin/python
+PY=${PYTHON:-$ROOT/conda_envs/tva_gnn/bin/python}
 GAUGES=$ROOT/processed/gauges_public/gauges.nc
 TEST=$ROOT/processed/test_preparation_2020_2025
 REFORECAST=$ROOT/processed/rain_forecasts/gefs_reforecast_240
@@ -42,20 +43,35 @@ OPERATIONAL=$ROOT/processed/rain_forecasts/gefs_operational_240
 GPUS=(${GPUS:-0 1 2 3})
 SCRATCH_UPDATES=${SCRATCH_UPDATES:-8000}  # A3, A6: the A0 budget of stage A (5000) + stage B (3000) updates
 SEEDS=${SEEDS:-2 3}
+TRAIN_WORKERS=${TRAIN_WORKERS:-5}  # data-loader workers per training process
+EVAL_EXTRA=(${EVAL_EXTRA:-})       # extra evaluate arguments (Frontier: --no-reaches --rains gefs)
+NO_REPORT=${NO_REPORT:-}           # non-empty: skip the report steps (Frontier: reports are made locally)
+QUEUE_DIR=${QUEUE_DIR:-$LOGS}      # a node-local folder when the log folder is on a network file system
 SEED_VARIANTS=${SEED_VARIANTS:-A0 A5}
 mkdir -p "$A" "$LOGS"
 
 say() { echo "[$(date '+%F %T')] $*"; }
-step() {  # step OUT LOG command...: run unless OUT/DONE; mark DONE or FAILED
+claim() {  # claim OUT for this Slurm job (an atomic mkdir); a claim of a job that is gone is taken over
+  local out=$1 owner
+  mkdir -p "$(dirname "$out")"
+  if mkdir "$out.claim" 2>/dev/null; then echo "${SLURM_JOB_ID:-local}" >"$out.claim/owner"; return 0; fi
+  owner=$(cat "$out.claim/owner" 2>/dev/null)
+  if [ -n "$owner" ] && [ "$owner" != local ] && command -v squeue >/dev/null && [ -z "$(squeue -h -j "$owner" 2>/dev/null)" ]; then
+    rm -rf "$out.claim"; mkdir "$out.claim" 2>/dev/null && { echo "${SLURM_JOB_ID:-local}" >"$out.claim/owner"; return 0; }
+  fi
+  return 1
+}
+step() {  # step OUT LOG command...: run unless OUT/DONE or claimed by another job; mark DONE or FAILED
   local out=$1 log=$2; shift 2
   [ -f "$out/DONE" ] && return 0
   if [ -n "${DRY_RUN:-}" ]; then echo "  $*  >> $log"; return 0; fi
+  claim "$out" || { say "skip $(basename "$out"): running in another job"; return 0; }
   rm -f "$out/FAILED"
   say "start $(basename "$out")"
   if "$@" >>"$log" 2>&1; then
-    mkdir -p "$out"; touch "$out/DONE"; say "done $(basename "$out")"
+    mkdir -p "$out"; touch "$out/DONE"; rm -rf "$out.claim"; say "done $(basename "$out")"
   else
-    mkdir -p "$out"; touch "$out/FAILED"; say "FAILED $(basename "$out") (see $log)"; return 1
+    mkdir -p "$out"; touch "$out/FAILED"; rm -rf "$out.claim"; say "FAILED $(basename "$out") (see $log)"; return 1
   fi
 }
 wait_for() {  # wait until every named output is DONE; fail if one FAILED
@@ -72,13 +88,14 @@ suffix() { [ "$1" -gt 0 ] && echo "_f$1"; }
 
 # A0 seed 1 is the existing GNN: link it (the gauges-only selection picks the same checkpoints).
 link_a0() {
+  [ -d "$M/gnn_B" ] || return 0   # not on Frontier
   [ -e "$A/A0_s1" ] || ln -s "$M/gnn_B" "$A/A0_s1"
   for k in 1 2 3 4 5; do [ -e "$A/A0_s1_f$k" ] || ln -s "$M/gnn_B_f$k" "$A/A0_s1_f$k"; done
   [ -e "$A/eval_A0_s1" ] || ln -s "$M/gnn_evaluation" "$A/eval_A0_s1"
 }
 
 # ---- training ------------------------------------------------------------------------------------------------
-B_COMMON=(--stage B --loss nse-q --head lstm --delta-weight 0 --accumulate 8 --select gauges)
+B_COMMON=(--stage B --loss nse-q --head lstm --delta-weight 0 --accumulate 8 --select gauges --resume --workers "$TRAIN_WORKERS")
 B_UPDATES=(--updates 3000 --lr 3e-4 --warmup 100 --validate-every 500)
 SCRATCH=(--updates "$SCRATCH_UPDATES" --lr 5e-4 --warmup 500 --validate-every 1000)
 
@@ -97,7 +114,7 @@ variant_args() {  # the stage-B arguments of a variant
 
 train() {  # train NAME GPU SEED [train arguments]
   local name=$1 gpu=$2 seed=$3; shift 3
-  step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="$gpu" \
+  step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="$gpu" HIP_VISIBLE_DEVICES="$gpu" \
     "$PY" -W ignore::UserWarning -m tva_flood.hydro.train --out "$A/$name" --seed "$seed" "$@"
 }
 
@@ -113,14 +130,14 @@ train_variant() {  # train_variant VARIANT SEED FOLD GPU: the Exp.1 model of tha
 }
 
 lumped_stage_a() {  # the lumped model's NWM pre-training, as models/gefs_hydro_A for the GNN
-  train lumped_A "$1" 1 --stage A --lumped --accumulate 8 --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000
+  train lumped_A "$1" 1 --stage A --lumped --accumulate 8 --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000 --resume --workers "$TRAIN_WORKERS"
 }
 
 # ---- evaluation ----------------------------------------------------------------------------------------------
 evaluate() {  # evaluate NAME GPU MODEL FOLD_TEMPLATE LABEL [evaluate arguments]
   local name=$1 gpu=$2 model=$3 folds=$4 label=$5; shift 5
-  step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="$gpu" \
-    "$PY" -W ignore::UserWarning -m tva_flood.hydro.evaluate --out "$A/$name" --model "$model" --fold-models "$folds" --label "$label" "$@"
+  step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="$gpu" HIP_VISIBLE_DEVICES="$gpu" \
+    "$PY" -W ignore::UserWarning -m tva_flood.hydro.evaluate --out "$A/$name" --model "$model" --fold-models "$folds" --label "$label" "${EVAL_EXTRA[@]}" "$@"
 }
 
 evaluate_variant() {  # evaluate_variant VARIANT SEED GPU [evaluate arguments]: all gauges + 5 folds
@@ -161,7 +178,7 @@ lstm_benchmark() {  # lstm_benchmark SEED FOLD (CPU, 12 processes; as models/gef
 }
 
 # ---- the GPU queue -------------------------------------------------------------------------------------------
-QUEUE=$LOGS/queue_$PHASE
+QUEUE=$QUEUE_DIR/queue_$PHASE
 next_job() {
   (
     flock 9
@@ -196,6 +213,7 @@ run_queue() {  # the jobs on stdin, one GPU each, in order
 
 report() {
   local section
+  [ -n "$NO_REPORT" ] && return 0
   for section in "$@"; do
     case $section in
       phase1 | blocked | coverage)

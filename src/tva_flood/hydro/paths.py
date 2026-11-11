@@ -1,10 +1,11 @@
 """Data locations and fixed windows (six-hour steps)."""
 
+import os
 from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path("/data/tva_data")
+ROOT = Path(os.environ.get("TVA_ROOT", "/data/tva_data"))  # TVA_ROOT: the data root on another machine (Frontier)
 PROCESSED = ROOT / "processed"
 TRAIN_PREP = PROCESSED / "pretraining_full"
 TRAIN_ARRAYS = PROCESSED / "pretraining_full_arrays"

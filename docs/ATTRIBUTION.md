@@ -5,7 +5,8 @@ gauged sites (0.415 vs 0.414). Is the held-out gain from the river graph, the NW
 baseline was trained? Every model here follows the GEFS rule and the current GNN recipe (stage B, `--loss nse-q
 --head lstm`, 3000 updates of 8 samples), selected on 2019 gauge scores only (`--select gauges`).
 
-Runner: `scripts/attribution_pipeline.sh PHASE` (each phase started by hand; `DRY_RUN=1` lists the jobs).
+Runner: `scripts/attribution_pipeline.sh PHASE`; on Frontier see `scripts/frontier/README.md` (portable via `TVA_ROOT`, resumes cut-off runs,
+several nodes share one job list) (each phase started by hand; `DRY_RUN=1` lists the jobs).
 Outputs: models in `/data/tva_data/models/attr/`, reports in `/data/tva_data/figures/attribution/`.
 
 ## What existed before this work

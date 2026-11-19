@@ -96,6 +96,16 @@ def withheld(gauges, network=None, fold=0, scheme="random", keep=1.0, keep_seed=
     return out
 
 
+def blocked_held_out(fold):
+    """Boolean mask over the public catalog gauges withheld in blocked ``fold`` (all False for fold 0): the same
+    gauges the GNN's blocked fold withholds. For the LSTM baselines (``--scheme blocked``)."""
+    from .data import Arrays, Gauges, Network
+
+    network = Network()
+    gauges = Gauges(network, Arrays().times)
+    return withheld(gauges, network, fold, "blocked")
+
+
 def describe(split):
     """Short text of a checkpoint's split (``dict(scheme, keep, keep_seed)``)."""
     s = split or {}
@@ -103,3 +113,4 @@ def describe(split):
     if s.get("keep", 1.0) < 1.0:
         text += f", {100 * s['keep']:.0f}% of training gauges (draw {s.get('keep_seed', 0)})"
     return text
+

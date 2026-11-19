@@ -58,6 +58,8 @@ class Series:
     """Basin series, observed flow and its normalized form on one timeline."""
 
     def __init__(self, preparation, catalog, mean, std):
+        self.antecedent = None  # basin-mean antecedent storage [day, gauge, 7], loaded on first use (--antecedent)
+        self.preparation = Path(preparation)
         with np.load(preparation / "basin_series.npz", allow_pickle=True) as data:
             self.times = pd.DatetimeIndex(data["times"])
             self.weather = data["weather"]
@@ -71,11 +73,18 @@ class Series:
         self.z = self.z.astype(np.float32)
         self.finite = finite
 
-    def batch(self, issues, gauges, rain_steps, hide=None, cut=None):
+    def antecedent_at(self, issues, gauges):
+        """The 7 basin-mean antecedent-storage features at each issue's day [B, 7] (scripts/build_basin_antecedent.py)."""
+        if self.antecedent is None:
+            self.antecedent = np.load(self.preparation.parent / "hydro/basin_antecedent.npy", mmap_mode="r")
+            self.day = np.asarray((self.times - pd.Timestamp("1979-02-01")) // pd.Timedelta(days=1))
+        return np.asarray(self.antecedent[self.day[issues], gauges], dtype=np.float32)
+
+    def batch(self, issues, gauges, rain_steps, hide=None, cut=None, antecedent=False):
         """Inputs and raw targets for (issue index, gauge) pairs.
 
         ``hide`` [B] hides the flow history; ``cut`` [B] is the number of leads with
-        known rain (default ``rain_steps``).
+        known rain (default ``rain_steps``); ``antecedent`` appends the basin-mean antecedent storage to the attributes.
         """
         window = issues[:, None] + np.arange(-HISTORY, 0)[None]
         weather = self.weather[window, gauges[:, None]]  # [B, history, 16]
@@ -90,7 +99,10 @@ class Series:
         limit = np.full(len(issues), rain_steps) if cut is None else cut
         rain = np.where((np.arange(HORIZON)[None] < limit[:, None])[..., None], rain, 0.0)
         target = self.observed[ahead, gauges[:, None]]
-        return history.astype(np.float32), self.static[gauges], rain.astype(np.float32), target
+        static = self.static[gauges]
+        if antecedent:
+            static = np.concatenate([static, self.antecedent_at(issues, gauges)], axis=1)
+        return history.astype(np.float32), static, rain.astype(np.float32), target
 
 
 def forecast_inputs(root, prep, data, catalog, folder, times, steps):
@@ -128,6 +140,14 @@ def main():
     p.add_argument("--raw-weight", type=float, default=1.0)
     p.add_argument("--high-flow-weight", type=float, default=2.0)
     p.add_argument("--history-hide", type=float, default=0.1)
+    p.add_argument("--area-output", action="store_true",
+                   help="Predict normalized log specific discharge (flow per catchment area) and multiply by the gauge's area: "
+                        "the graph models' output form (runoff depth x area)")
+    p.add_argument("--loss", choices=["mixed", "nse"], default="mixed",
+                   help="mixed: normalized log-flow error + raw error with high-flow weight (the LSTM baseline); "
+                        "nse: the NSE* of the graph models (squared error over (gauge std + 0.1)^2, no log term, no flood weight)")
+    p.add_argument("--antecedent", action="store_true",
+                   help="Add the graph models' 7 antecedent-storage features (basin means) to the attributes")
     p.add_argument(
         "--validation-hidden",
         action="store_true",
@@ -157,6 +177,8 @@ def main():
     p.add_argument("--holdout-fold", type=int, default=0, help="Withhold this fold (0: none)")
     p.add_argument("--folds", type=int, default=0)
     p.add_argument("--fold-seed", type=int, default=0)
+    p.add_argument("--scheme", choices=["random", "blocked"], default="random",
+                   help="blocked: --holdout-fold k (of 3) withholds the whole tributary basin of hydro.splits block k")
     p.add_argument("--evaluations", type=int, default=0, help="Overrides --eval-every (0: off)")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--seed", type=int, default=42)
@@ -183,7 +205,12 @@ def main():
     mean, std = float(data.mean[8]), float(data.std[8])
     catalog = Catalog((a.gauges or root / "processed/gauges/gauges.nc").resolve())
     series = Series(prep, catalog, mean, std)
-    held = held_out(root, catalog, a.holdout_fold, a.folds, a.fold_seed)
+    if a.scheme == "blocked":
+        from tva_flood.hydro.splits import blocked_held_out
+
+        held = blocked_held_out(a.holdout_fold)
+    else:
+        held = held_out(root, catalog, a.holdout_fold, a.folds, a.fold_seed)
     series.observed[:, held] = np.nan  # withheld gauges: no target, no history
     series.z[:, held] = 0.0
     series.finite[:, held] = False
@@ -247,10 +274,27 @@ def main():
     with np.errstate(all="ignore"):
         scale = np.nan_to_num(np.maximum(np.nanstd(before, axis=0), 1e-2), nan=1.0)
         high = np.nan_to_num(np.nanquantile(before, 0.9, axis=0), nan=np.inf)
+    out_mean, out_std = mean, std  # the output's normalization: log flow, or log specific discharge with --area-output
+    area = np.ones(len(catalog))
+    if a.area_output:
+        nodes = pd.read_parquet(root / "processed/graph_candidate/nodes.parquet", columns=["comid", "totdasqkm"]).set_index("comid")
+        area = nodes.totdasqkm.reindex(catalog.comid).to_numpy(dtype=float)
+        if not np.isfinite(area).all() or (area <= 0).any():
+            p.error("--area-output needs a drainage area for every gauge")
+        with np.errstate(all="ignore"):
+            specific = np.log1p(np.maximum(before, 0) * 21.6 / area[None])
+            out_mean, out_std = float(np.nanmean(specific)), float(np.nanstd(specific))
+    area_t = torch.as_tensor(area, dtype=torch.float64, device=device)
     scale_t = torch.as_tensor(scale, dtype=torch.float32, device=device)
     high_t = torch.as_tensor(high, dtype=torch.float32, device=device)
     weights = torch.as_tensor(lead_weights("balanced"), dtype=torch.float32, device=device)
-    model = ForecastLSTM(hidden=a.hidden, dropout=a.dropout, horizon=HORIZON).to(device)
+    static_dim = 48 + (7 if a.antecedent else 0)
+    model = ForecastLSTM(static=static_dim, hidden=a.hidden, dropout=a.dropout, horizon=HORIZON).to(device)
+
+    def to_flow(z, g):
+        """Flow [B, lead] from the network's output z for gauges g (array of catalog indices, or one index)."""
+        flow = raw(z, out_mean, out_std)
+        return flow * area_t[g].reshape(-1, 1) / 21.6 if a.area_output else flow
     optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     warmup = min(500, a.updates // 10)
 
@@ -268,8 +312,13 @@ def main():
         horizon=HORIZON,
         history=HISTORY,
         rain_hours=a.rain_hours,
-        flow_mean=mean,
-        flow_std=std,
+        flow_mean=out_mean,  # the output's normalization (specific discharge with area_output)
+        flow_std=out_std,
+        area_output=a.area_output,
+        areas=area.tolist(),
+        antecedent=a.antecedent,
+        static_dim=static_dim,
+        loss=a.loss,
         gauges=catalog.names.tolist(),
         preparation=str(prep),
         training_pairs=int(len(train_issue)),
@@ -302,7 +351,7 @@ def main():
         with torch.no_grad():
             for g in v_gauges:
                 gauges = np.full(len(v_issue), g)
-                history, static, rain, target = series.batch(v_issue, gauges, rain_steps, hide_all if hidden else None)
+                history, static, rain, target = series.batch(v_issue, gauges, rain_steps, hide_all if hidden else None, antecedent=a.antecedent)
                 if a.validation_rain:
                     day = forecast_day[a.validation_rain][v_issue]
                     rain = forecast_basin[a.validation_rain][day, g]
@@ -311,7 +360,7 @@ def main():
                     torch.as_tensor(static, device=device),
                     torch.as_tensor(rain, device=device),
                 )
-                predictions[:, :, g] = raw(z, mean, std).cpu().numpy()
+                predictions[:, :, g] = to_flow(z, g).cpu().numpy()
                 ok = series.finite[v_issue - 1, g][:, None]
                 targets[:, :, g] = np.where(ok, target, np.nan)
         model.train()
@@ -348,7 +397,7 @@ def main():
             issues, gauges = train_issue[pick], train_gauge[pick]
             use &= cut > 0  # unknown rain stays unknown
             cut[use] = rain_steps
-        history, static, rain, target = series.batch(issues, gauges, rain_steps, hide, cut)
+        history, static, rain, target = series.batch(issues, gauges, rain_steps, hide, cut, antecedent=a.antecedent)
         if use.any():
             day = forecast_day[a.forecast_rain][issues[use]]
             rain[use] = forecast_basin[a.forecast_rain][day, gauges[use]]
@@ -362,12 +411,18 @@ def main():
         truth = torch.nan_to_num(target)
         weight = weights[None] * mask
         total = weight.sum().clamp_min(1)
-        truth_z = (torch.log1p(truth.clamp_min(0)) - mean) / std
-        log_term = (weight * (z - truth_z).square()).sum() / total
         g = torch.as_tensor(gauges, device=device)
-        error = (raw(z, mean, std).float() - truth) / scale_t[g][:, None]
-        emphasis = 1 + a.high_flow_weight * (truth > high_t[g][:, None]).float()
-        raw_term = (weight * emphasis * error.square()).sum() / total
+        if a.loss == "nse":  # NSE* as the graph models: no log term, no flood weight, scaled by (std + 0.1)
+            log_term = torch.zeros((), device=device)
+            error = (to_flow(z, g).float() - truth) / (scale_t[g][:, None] + 0.1)
+            raw_term = (weight * error.square()).sum() / total
+        else:
+            truth_spec = truth.double() * 21.6 / area_t[g][:, None] if a.area_output else truth.double()
+            truth_z = ((torch.log1p(truth_spec.clamp_min(0)) - out_mean) / out_std).float()
+            log_term = (weight * (z - truth_z).square()).sum() / total
+            error = (to_flow(z, g).float() - truth) / scale_t[g][:, None]
+            emphasis = 1 + a.high_flow_weight * (truth > high_t[g][:, None]).float()
+            raw_term = (weight * emphasis * error.square()).sum() / total
         loss = log_term + a.raw_weight * raw_term
         optimizer.zero_grad(set_to_none=True)
         loss.backward()

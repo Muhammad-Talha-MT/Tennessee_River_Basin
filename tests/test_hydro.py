@@ -27,6 +27,8 @@ def network():
         share=share.astype(np.float32),
         group=group,
         basin_area=op["basin_area_km2"],
+        edges=EDGES,
+        static=np.zeros((5, 48), dtype=np.float32),
     )
 
 
@@ -150,3 +152,67 @@ def test_graph_block_without_mixing_ignores_neighbours():
     assert torch.allclose(block(h, graph)[1], block(changed, graph)[1])
     block.mixing = True
     assert not torch.allclose(block(h, graph)[1], block(changed, graph)[1])
+
+
+def manning(net, gauges=(1, 3)):
+    from tva_flood.hydro.channel import ManningRouter
+
+    table = dict(length=np.full(5, 10.0), slope=np.full(5, 1e-3), order=np.ones(5), lake=np.array([False, False, False, True, False]))
+    r = ManningRouter()
+    r.attach(net, np.array(gauges), torch.device("cpu"), table=table)
+    return r
+
+
+def test_manning_routing_conserves_mass_and_delays_with_distance():
+    net = network()
+    r = manning(net)
+    q = torch.zeros(5, P.FLOW_STEPS)
+    q[0, 10] = 6.0
+    r.prepare(r.reference_flow(q + 1.0))
+    routed = r(q)
+    assert torch.isclose(routed[4].sum(), torch.tensor(6.0), rtol=1e-5)  # all of it arrives
+    assert routed[4, :10].abs().sum() == 0  # nothing before the pulse
+    peak = routed.argmax(dim=1)
+    assert peak[0] <= peak[1] <= peak[3] <= peak[4]  # later the further down
+    assert torch.allclose(r(q, gauges_only=True), routed[[1, 3]], atol=1e-6)
+
+
+def test_manning_travel_time_falls_with_flow():
+    net = network()
+    r = manning(net)
+    with torch.no_grad():
+        slow = r.reach_time(torch.full((5,), 1.0))
+        fast = r.reach_time(torch.full((5,), 100.0))
+    river = torch.tensor([True, True, True, False, True])  # reach 3 is a lake: its speed does not depend on flow
+    assert (fast[river] < slow[river]).all()
+    assert torch.isclose(fast[3], slow[3])
+
+
+def test_manning_gradients_reach_the_channel_parameters():
+    torch.manual_seed(0)
+    net = network()
+    r = manning(net)
+    with torch.no_grad():
+        r.channel[-1].weight.normal_(0, 0.1)  # off the zero start, so every layer gets a gradient
+    q = torch.rand(5, P.FLOW_STEPS, requires_grad=True)
+    r.prepare(r.reference_flow(q))
+    target = torch.linspace(0, 1, P.FLOW_STEPS)
+    loss = ((r(q)[4] - target) ** 2).mean()
+    loss.backward()
+    assert q.grad is not None and q.grad.abs().sum() > 0
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in r.parameters())
+
+
+def test_insertion_reaches_only_reaches_below_the_gauge_and_conserves_mass():
+    net = network()
+    r = manning(net, gauges=(1, 3))
+    q = torch.ones(5, P.FLOW_STEPS)
+    r.prepare(r.reference_flow(q))
+    dq = torch.zeros(2, P.FLOW_STEPS)
+    dq[0, 5] = 2.0  # a correction at the gauge of reach 1
+    to_reaches = r(dq, op="insert")
+    assert to_reaches[[0, 1, 2]].abs().sum() == 0  # not upstream, not itself, not the other branch
+    assert torch.isclose(to_reaches[3].sum(), torch.tensor(2.0), rtol=1e-5)
+    assert torch.isclose(to_reaches[4].sum(), torch.tensor(2.0), rtol=1e-5)
+    to_gauges = r(dq, op="insert_gauges")
+    assert torch.allclose(to_gauges[1], to_reaches[3], atol=1e-6) and to_gauges[0].abs().sum() == 0

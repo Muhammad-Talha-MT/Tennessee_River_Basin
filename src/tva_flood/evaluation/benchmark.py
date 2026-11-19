@@ -128,6 +128,8 @@ def main():
     p.add_argument("--holdout-fold", type=int, default=0, help="Score this withheld fold only")
     p.add_argument("--folds", type=int, default=0)
     p.add_argument("--fold-seed", type=int, default=0)
+    p.add_argument("--scheme", choices=["random", "blocked"], default="random",
+                   help="blocked: --holdout-fold k (of 3) scores the CAMELS-H gauges of hydro.splits block k")
     p.add_argument("--issues-from")
     p.add_argument("--issues-until")
     p.add_argument("--train-until", default="2019-01-01", help="Climatology period end")
@@ -170,7 +172,12 @@ def evaluate(a, p, rank, world, device):
         usgs = info.usgs_id.values.astype(str)
         camelsh = info.camelsh.values.astype(bool)
     sites = camelsh if a.sites == "camelsh" else np.ones(len(catalog), bool)
-    held = held_out(root, catalog, a.holdout_fold, a.folds, a.fold_seed)
+    if a.scheme == "blocked":
+        from tva_flood.hydro.splits import blocked_held_out
+
+        held = blocked_held_out(a.holdout_fold)
+    else:
+        held = held_out(root, catalog, a.holdout_fold, a.folds, a.fold_seed)
     if a.holdout_fold:
         sites = sites & held
     scored = np.flatnonzero(sites)
@@ -226,20 +233,23 @@ def evaluate(a, p, rank, world, device):
             state = torch.load(path, map_location="cpu", weights_only=False)
             c = state["config"]
             trained = c.get("arguments", {})
-            if (trained.get("holdout_fold") or 0, trained.get("folds") or 0) != (
+            if (trained.get("holdout_fold") or 0, trained.get("folds") or 0, trained.get("scheme", "random") if trained.get("holdout_fold") else "random") != (
                 a.holdout_fold,
                 a.folds if a.holdout_fold else 0,
+                a.scheme if a.holdout_fold else "random",
             ):
                 p.error(f"{name} was not trained with fold {a.holdout_fold} of {a.folds} withheld")
             if list(c["gauges"]) != list(catalog.names):
                 p.error(f"{name} was trained on different gauges")
-            model = ForecastLSTM(hidden=c["hidden"], dropout=c["dropout"], horizon=HORIZON)
+            model = ForecastLSTM(static=c.get("static_dim", 48), hidden=c["hidden"], dropout=c["dropout"], horizon=HORIZON)
             model.load_state_dict(state["model"])
             lstms[name] = (
                 model.to(device).eval(),
                 c["rain_hours"] // 6,
                 c["flow_mean"],
                 c["flow_std"],
+                (torch.as_tensor(np.asarray(c["areas"])[scored] / 21.6, device=device) if c.get("area_output") else None),
+                bool(c.get("antecedent")),
             )
     nwm, nwm_names = load_nwm(a.nwm or root / "processed/benchmarks/nwm_medium_range")
     if nwm_names is None:
@@ -298,9 +308,9 @@ def evaluate(a, p, rank, world, device):
                 for tag, future in list(futures.items()) + [("aorc", rain_aorc)]:
                     output = model(dynamic, static, future[None].to(device), graph_supports)[0]
                     values[f"{name}+{tag}"] = raw_flow(output[:, graph["local"]], mean, std)
-            for name, (model, rain_steps, lmean, lstd) in lstms.items():
+            for name, (model, rain_steps, lmean, lstd, per_area, antecedent) in lstms.items():
                 history, basin_static, rain_aorc, _ = series.batch(
-                    np.full(len(scored), issue), scored, rain_steps, held[scored]
+                    np.full(len(scored), issue), scored, rain_steps, held[scored], antecedent=antecedent
                 )
                 basin = {
                     tag: basin_forecast(field, rows, covered, inputs.rain, rain_steps)
@@ -312,7 +322,8 @@ def evaluate(a, p, rank, world, device):
                         torch.as_tensor(basin_static, device=device),
                         torch.as_tensor(rain_in, device=device),
                     )
-                    values[f"{name}+{tag}"] = raw_flow(z_out.T, lmean, lstd)
+                    flow = raw_flow(z_out.T, lmean, lstd)
+                    values[f"{name}+{tag}"] = flow * per_area[None] if per_area is not None else flow
             values["nwm"] = torch.nan_to_num(nwm_flow)
             values["persistence"] = torch.nan_to_num(latest)[None].expand(HORIZON, -1).double()
             ahead = times[issue + np.arange(HORIZON)]
@@ -460,7 +471,7 @@ def write(a, out, stations, names, totals, saved, issues, first, last, gauges_nc
             lstm=dict(a.lstms),
             gauges=str(gauges_nc),
             sites=a.sites,
-            held_out_fold=dict(fold=a.holdout_fold, folds=a.folds, seed=a.fold_seed)
+            held_out_fold=dict(fold=a.holdout_fold, folds=a.folds, seed=a.fold_seed, scheme=a.scheme)
             if a.holdout_fold
             else None,
             stations=stations.station.tolist(),

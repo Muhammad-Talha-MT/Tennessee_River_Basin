@@ -324,6 +324,9 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     # Attribution experiments (docs/ATTRIBUTION.md); the defaults reproduce the current model.
     p.add_argument("--off", nargs="*", default=[], choices=ABLATIONS, help="Parts of the river-network design switched off")
+    p.add_argument("--router", choices=["kernel", "manning"], default="kernel", help="Routing: shared group kernels, or Manning travel times per reach (hydro.channel)")
+    p.add_argument("--insert", action="store_true", help="Gauge-flow insertion: visible gauges correct every reach below them (needs --router manning)")
+    p.add_argument("--graph-layers", type=int, default=3, help="Graph message-passing layers (0: routed per reach, no graph layers; hop-depth ablation)")
     p.add_argument("--lumped", action="store_true", help="Non-graph control: every reach a lumped basin (model.LumpedModel)")
     p.add_argument("--lumped-reaches", type=int, default=0, help="Lumped model: train on this many random reaches per sample plus the gauges (0: all)")
     p.add_argument("--no-nwm", action="store_true", help="No NWM anywhere: needs no --init, sets --nwm-weight 0 and --select gauges")
@@ -376,7 +379,8 @@ def train(a, rank, world, device):
     elif a.trunk == "attention":
         model = AttentionGNN(s.network.groups, s.network.delay, **common, compile=True)
     else:
-        model = HydroModel(s.network.groups, s.network.delay, **common, off=a.off)
+        model = HydroModel(s.network.groups, s.network.delay, **common, off=a.off, graph_layers=a.graph_layers,
+                           router=a.router, insert=a.insert)
     model = model.to(device)
     if a.init:  # stage A trains runoff and routing only; every head starts fresh
         state = torch.load(a.init, map_location="cpu", weights_only=False)
@@ -414,8 +418,8 @@ def train(a, rank, world, device):
     resume_file = out / "resume.pt"
     if a.resume and resume_file.exists():
         saved = torch.load(resume_file, map_location="cpu", weights_only=False)
-        if saved["updates"] != a.updates or saved["accumulate"] != a.accumulate or saved["seed"] != a.seed:
-            raise ValueError(f"{resume_file} belongs to another run (updates, accumulate or seed differ)")
+        if saved["updates"] != a.updates or saved["accumulate"] * saved.get("world", 1) != a.accumulate * world or saved["seed"] != a.seed:
+            raise ValueError(f"{resume_file} belongs to another run (updates, samples per update or seed differ)")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
         best, log, first = saved["best"], saved["log"], saved["update"] + 1
@@ -431,7 +435,7 @@ def train(a, rank, world, device):
 
     def save_resume(update):  # rank 0 only
         state = dict(model=model.state_dict(), optimizer=optimizer.state_dict(), update=update, best=best, log=log,
-                     updates=a.updates, accumulate=a.accumulate, seed=a.seed)
+                     updates=a.updates, accumulate=a.accumulate, world=world, seed=a.seed)
         save_atomic(state, resume_file)
 
     for update in range(first, a.updates + 1):

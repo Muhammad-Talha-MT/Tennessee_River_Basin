@@ -47,21 +47,41 @@ VARIANTS = {
     "A2": ("GNN, instantaneous routing", "yes", "instant", "yes", "yes", "learned travel times"),
     "A3": ("GNN without NWM", "yes", "learned", "no", "no", "graph without the simulation"),
     "A4": ("GNN, no stage-B NWM prior", "yes", "learned", "yes", "no", "prior as regularizer"),
+    "R0": ("Routed per reach, no graph layers", "no", "learned", "yes", "yes", "routing alone (own stage A)"),
+    "M0": ("GNN, Manning routing + gauge-flow insertion", "yes", "Manning", "yes", "yes", "physics routing and gauge information downstream"),
+    "M1": ("GNN, Manning routing", "yes", "Manning", "yes", "yes", "Manning routing alone"),
+    "M2": ("Manning routing + insertion, no graph layers", "no", "Manning", "yes", "yes", "do the graph layers earn their place"),
     "A5": ("Lumped reach model, same NWM training", "no", "none", "yes", "yes", "graph vs NWM supervision (key control)"),
     "A6": ("Lumped reach model, no NWM", "no", "none", "no", "no", "observation-only baseline"),
 }
+LADDER = {"L1": "LSTM + area-scaled output", "L2": "LSTM + NSE* loss", "L3": "LSTM + antecedent inputs", "L4": "LSTM + all three"}
 COMPARISONS = [  # (name, better, worse): difference better - worse
     ("graph | NWM (A0 - A5)", "A0", "A5"),
     ("graph | no NWM (A3 - A6)", "A3", "A6"),
     ("NWM | graph (A0 - A3)", "A0", "A3"),
     ("NWM | lumped (A5 - A6)", "A5", "A6"),
     ("exchange (A0 - A1)", "A0", "A1"),
+    ("graph layers over routing alone (A0 - R0)", "A0", "R0"),
+    ("Manning routing + insertion (M0 - A0)", "M0", "A0"),
+    ("Manning routing (M1 - A0)", "M1", "A0"),
+    ("gauge-flow insertion (M0 - M1)", "M0", "M1"),
+    ("graph layers with Manning routing (M0 - M2)", "M0", "M2"),
+    ("M0 - LSTM-AS (M0 - L4)", "M0", "L4"),
+    ("M0 - lumped (M0 - A5)", "M0", "A5"),
+    ("routing over lumped (R0 - A5)", "R0", "A5"),
     ("learned routing (A0 - A2)", "A0", "A2"),
     ("stage-B prior (A0 - A4)", "A0", "A4"),
     ("GNN - LSTM (original)", "A0", "LSTM"),
     ("GNN - LSTM (matched masking)", "A0", "LSTM_matched"),
     ("LSTM matched - original", "LSTM_matched", "LSTM"),
     ("lumped GNN-head - LSTM matched (A6 - LSTM_matched)", "A6", "LSTM_matched"),
+    ("area-scaled output (L1 - matched)", "L1", "LSTM_matched"),
+    ("NSE* loss (L2 - matched)", "L2", "LSTM_matched"),
+    ("antecedent inputs (L3 - matched)", "L3", "LSTM_matched"),
+    ("all three (L4 - matched)", "L4", "LSTM_matched"),
+    ("what is left (A6 - L4)", "A6", "L4"),
+    ("GNN - LSTM-AS (A0 - L4)", "A0", "L4"),
+    ("GNN without NWM - LSTM-AS (A3 - L4)", "A3", "L4"),
 ]
 
 
@@ -268,6 +288,8 @@ def entries_for(model, seeds):
     """Evaluation sources of a model over ``seeds``."""
     if model == "LSTM":
         return [("lstm", str(P.MODELS / "gefs_benchmark{suffix}"))]
+    if model in LADDER:
+        return [("lstm", str(ATTR / f"ladder_{model}_s{s}_bench{{suffix}}")) for s in seeds]
     if model == "LSTM_matched":
         return [("lstm", str(ATTR / f"lstm_matched_s{s}_bench{{suffix}}")) for s in seeds]
     return [("hydro", str(ATTR / f"eval_{model}_s{s}")) for s in seeds]
@@ -277,16 +299,31 @@ def fmt(x, digits=3):
     return "-" if x is None or not np.isfinite(x) else f"{x:.{digits}f}"
 
 
+def below_visible_gauge(info):
+    """Held-out gauges (random folds) with a gauge upstream that their fold model sees: where gauge-flow insertion acts."""
+    gauges, network = info["gauges"], info["network"]
+    fold = splits.gauge_folds("random", gauges)
+    at = np.full(network.n, -1)
+    at[gauges.reach] = np.arange(gauges.count)
+    out = np.zeros(gauges.count, bool)
+    for g in np.flatnonzero(fold > 0):
+        inside = at[gauges.basins[g]]
+        inside = inside[(inside >= 0) & (inside != g)]
+        out[g] = bool(((fold[inside] != fold[g]) & gauges.trained[inside]).any())
+    return out
+
+
 def phase1(a, info):
     out = OUT / "phase1"
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
-    models = list(VARIANTS) + ["LSTM", "LSTM_matched"]
+    models = list(VARIANTS) + ["LSTM", "LSTM_matched"] + list(LADDER)
     entries = {m: entries_for(m, a.seeds) for m in models}
     entries = {"A0": entries.pop("A0"), **entries}  # the reference first
     names = info["names"]
     held = splits.gauge_folds("random", info["gauges"]) > 0
-    subsets = {"all": np.ones(len(names), bool), "headwater, no dam": info["groups"]["headwater, no dam"]}
+    subsets = {"all": np.ones(len(names), bool), "headwater, no dam": info["groups"]["headwater, no dam"],
+               "below a visible gauge": below_visible_gauge(info)}
     lines = [
         "# Attribution experiments, phase 1 (Exp.1 and the LSTM checks)",
         "",
@@ -357,7 +394,9 @@ def phase1(a, info):
                 if np.isfinite(p):
                     params.append(p)
                     hours += h
-        stage_a = {"A0": P.MODELS / "gefs_hydro_A", "A1": P.MODELS / "gefs_hydro_A", "A2": P.MODELS / "gefs_hydro_A", "A4": P.MODELS / "gefs_hydro_A", "A5": ATTR / "lumped_A"}.get(m)
+        stage_a = {"A0": P.MODELS / "gefs_hydro_A", "A1": P.MODELS / "gefs_hydro_A", "A2": P.MODELS / "gefs_hydro_A", "A4": P.MODELS / "gefs_hydro_A",
+                   "A5": ATTR / "lumped_A", "R0": ATTR / "nograph_A",
+                   "M0": ATTR / "manning_A", "M1": ATTR / "manning_A", "M2": ATTR / "manning0_A"}.get(m)
         cost_rows.append(dict(model=m, parameters=params[0] if params else np.nan, gpu_hours_stage_b=hours,
                               gpu_hours_stage_a=run_cost(stage_a)[1] if stage_a else 0.0))
     cost = pd.DataFrame(cost_rows).set_index("model")
@@ -366,7 +405,7 @@ def phase1(a, info):
               "|---|---|---|---|---|---|---:|---|---:|---:|---:|---:|---:|"]
     pick = lambda prot, sub, m, k: table.query("protocol == @prot and subset == @sub and model == @m")[k].squeeze() if len(table.query("protocol == @prot and subset == @sub and model == @m")) else np.nan  # noqa: E731
     for m in models:
-        label, graph, routing, pre, prior, _ = VARIANTS.get(m, (m.replace("_", " "), "no", "none", "no", "no", ""))
+        label, graph, routing, pre, prior, _ = VARIANTS.get(m, (LADDER.get(m, m.replace("_", " ")), "no", "none", "no", "no", ""))
         params = cost.parameters.get(m, np.nan) if m in cost.index else np.nan
         hours = f"{cost.gpu_hours_stage_b[m]:.0f} / {cost.gpu_hours_stage_a[m]:.0f}" if m in cost.index else "-"
         lines.append(f"| {m} | {label} | {graph} | {routing} | {pre} | {prior} | {'-' if not np.isfinite(params) else f'{int(params):,}'} | {hours} | "
@@ -429,6 +468,25 @@ def blocked(a, info):
         same = got.get("random")
         lines.append(f"| {m} | blocked | {int(np.isfinite(got['blocked']['nse_d15'][g]).sum())} | {fmt(np.nanmedian(got['blocked']['nse_d15'][g]))} | "
                      f"{fmt(np.nanmedian(got['blocked']['kge_d15'][g]))} | {fmt(np.nanmedian(same['nse_d15'][g])) if same else '-'} |")
+    # nested pairs: a scored gauge with another scored gauge upstream. Both are withheld in its block, so the model
+    # has no observed flow anywhere upstream; the score is against USGS observations, not the NWM.
+    G = info["gauges"]
+    at = np.full(info["network"].n, -1)
+    at[G.reach] = np.arange(G.count)
+    scored = gauge_fold > 0
+    nested = np.zeros(G.count, bool)
+    for g in np.flatnonzero(scored):
+        inside = at[G.basins[g]]
+        nested[g] = bool(((inside >= 0) & (inside != g) & scored[np.maximum(inside, 0)]).any())
+    lines += ["", f"Nested gauges (a scored gauge upstream, also withheld; {int((nested & scored).sum())} of {int(scored.sum())} scored gauges), "
+              "scored against observed flow:", "", "| model | group | gauges | median NSE | median KGE |", "|---|---|---:|---:|---:|"]
+    for m in a.models:
+        got = {r["scheme"]: r["sc"] for r in rows if r["model"] == m}
+        if "blocked" not in got:
+            continue
+        for name, sel in (("nested (downstream gauge)", nested & scored), ("no gauge upstream", ~nested & scored)):
+            lines.append(f"| {m} | {name} | {int(np.isfinite(got['blocked']['nse_d15'][sel]).sum())} | {fmt(np.nanmedian(got['blocked']['nse_d15'][sel]))} | "
+                         f"{fmt(np.nanmedian(got['blocked']['kge_d15'][sel]))} |")
     lines += ["", "The last column scores the same blocked gauges under the random folds, where their neighbours were in training:",
               "the drop from it to the blocked score is the value of nearby gauges."]
     (out / "report.md").write_text("\n".join(lines) + "\n")
@@ -477,7 +535,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("section", choices=["phase1", "blocked", "coverage"])
     p.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3], help="Seeds to include where they exist")
-    p.add_argument("--models", nargs="+", default=["A0", "A5"], help="blocked/coverage: models")
+    p.add_argument("--models", nargs="+", default=["A0", "A1", "R0", "M0", "M2", "A5"], help="blocked/coverage: models")
     a = p.parse_args()
     info = gauge_info()
     dict(phase1=phase1, blocked=blocked, coverage=coverage)[a.section](a, info)

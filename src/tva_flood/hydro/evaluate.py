@@ -174,9 +174,14 @@ def main():
     p.add_argument("--rains", nargs="+", choices=["gefs", "aorc"], default=["gefs", "aorc"],
                    help="Forecast rain sources scored (aorc: the realized-rain diagnostic)")
     p.add_argument("--no-reaches", action="store_true", help="Skip the every-reach protocol (gauges only, faster)")
+    p.add_argument("--only-folds", type=int, nargs="+", help="Score only these folds (their fold models must exist; the other folds' gauges stay unscored)")
+    p.add_argument("--heldout-only", action="store_true",
+                   help="Only the held-out protocol: no all-gauge model (--model is ignored), no gauged or every-reach scores")
     p.add_argument("--any-fold", action="store_true",
                    help="Accept fold models whose checkpoint names another fold (a stage-A model used for every fold)")
     a = p.parse_args()
+    if a.heldout_only:
+        a.no_reaches = True
     rank, world, local = (int(os.environ.get(k, d)) for k, d in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0)))
     device = torch.device(f"cuda:{local}")
     torch.cuda.set_device(device)
@@ -196,12 +201,13 @@ def evaluate(a, rank, world, device):
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)
     gpu = Device(network, gauges, arrays, device)
-    models = {0: load_model(a.model, s, device, a.legacy)[0]}
+    models = {} if a.heldout_only else {0: load_model(a.model, s, device, a.legacy)[0]}
     fold_states = {}
-    first = torch.load(Path(a.fold_models.format(k=1)), map_location="cpu", weights_only=False)
+    folds = list(a.only_folds) if a.only_folds else None
+    first = torch.load(Path(a.fold_models.format(k=(folds or [1])[0])), map_location="cpu", weights_only=False)
     scheme = (first.get("split") or {}).get("scheme", "random")
     a.scheme = scheme
-    for k in range(1, splits.fold_count(scheme, gauges, network) + 1):
+    for k in folds or range(1, splits.fold_count(scheme, gauges, network) + 1):
         model, state = load_model(Path(a.fold_models.format(k=k)), s, device, a.legacy)
         if state["fold"] != k and not a.any_fold:
             raise ValueError(f"Fold model {k} was trained with fold {state['fold']} withheld")
@@ -215,7 +221,8 @@ def evaluate(a, rank, world, device):
         withheld[k] = splits.withheld(gauges, network, k, scheme, split.get("keep", 1.0), split.get("keep_seed", 0))
         if split.get("keep", 1.0) <= 0:
             withheld[k] = np.ones(gauges.count, bool)
-    a.split = (fold_states[1].get("split") or dict(scheme=scheme))
+    a.loaded_folds = sorted(fold_states)
+    a.split = (fold_states[a.loaded_folds[0]].get("split") or dict(scheme=scheme))
     reach_model = torch.as_tensor(np.maximum(reach_fold, 0), device=device)
     sites = torch.as_tensor(gauges.camelsh, device=device)
 
@@ -285,14 +292,16 @@ def evaluate(a, rank, world, device):
                         reach_flow = result["reach"][:, FUTURE].T.double()
                         mine_reaches = (reach_model == k)[None]
                         composite[tag] = torch.where(mine_reaches, reach_flow, composite[tag])
-            for name in gauged_names:
-                value = values[name] if name.startswith("hydro") else refs[name]
-                acc["gauged"][name].add(value, truth0, mask)
-            fold_mask = mask & torch.as_tensor(gauge_fold > 0, device=device)[None]
+            if not a.heldout_only:
+                for name in gauged_names:
+                    value = values[name] if name.startswith("hydro") else refs[name]
+                    acc["gauged"][name].add(value, truth0, mask)
+            fold_mask = mask & torch.as_tensor(np.isin(gauge_fold, a.loaded_folds), device=device)[None]
             for name in ungauged_names:
                 value = values[name.replace("hydro", "ungauged")] if name.startswith("hydro") else refs[name]
                 acc["ungauged"][name].add(value, truth0, fold_mask)
-            kept["gauged"].append(_keep(step, truth, mask, [values.get(n, refs.get(n)) for n in gauged_names]))
+            if not a.heldout_only:
+                kept["gauged"].append(_keep(step, truth, mask, [values.get(n, refs.get(n)) for n in gauged_names]))
             kept["ungauged"].append(_keep(step, truth, fold_mask, [values[n] for n in a.ungauged_names]))
             if full:
                 retro0 = torch.nan_to_num(retro).double()
@@ -395,7 +404,7 @@ def header(first):
 
 def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     gauges, network, times = s.gauges, s.network, s.arrays.times
-    for name in ("gauged", "ungauged"):
+    for name in ("ungauged",) if a.heldout_only else ("gauged", "ungauged"):
         parts = [np.load(out / f".{name}_{r}.npz") for r in range(world)]
         parts = [q for q in parts if len(q["step"])]
         step = np.concatenate([q["step"] for q in parts])
@@ -420,25 +429,30 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
         "",
     ]
     lstm_path = lambda suffix: Path(a.lstm_benchmark.format(suffix=suffix)) / "forecasts.npz"  # noqa: E731
-    # 1. Gauged --------------------------------------------------------------------------
-    mine = gauge_table(acc["gauged"], a.min_count)
-    old = {}
-    if lstm_path("").exists():
-        old = saved_nse(lstm_path(""), [f"lstm+{r}" for r in a.rains], issues, times, a.min_count)
+    for r in range(world):  # an empty gauged part when --heldout-only
+        (out / f".gauged_{r}.npz").unlink(missing_ok=True)
     names = list(gauges.names)
+    # 1. Gauged --------------------------------------------------------------------------
+    mine = None if a.heldout_only else gauge_table(acc["gauged"], a.min_count)
+    old = {}
+    if mine is None:
+        lines += ["## 1. Gauged: skipped (--heldout-only)", ""]
+    if mine is not None and lstm_path("").exists():
+        old = saved_nse(lstm_path(""), [f"lstm+{r}" for r in a.rains], issues, times, a.min_count)
     rows = header("method (gauged, median NSE over gauges)")
-    for rain in a.rains:
+    for rain in a.rains if mine is not None else ():
         nse, scored = mine[f"hydro+{rain}"]
         rows.append(row(f"**{a.label}**+{rain}", medians(nse, scored)))
         for label, prefix in BASELINES:
             if f"{prefix}+{rain}" in old:
                 rows.append(row(f"{label}+{rain}", medians(old[f"{prefix}+{rain}"][0])))
-    for name in ("nwm", "persistence", "climatology"):
+    for name in ("nwm", "persistence", "climatology") if mine is not None else ():
         nse, scored = mine[name]
         rows.append(row(name, medians(nse, scored)))
-    lines += ["## 1. Gauged: CAMELS-H gauges against USGS", ""] + rows
+    if mine is not None:
+        lines += ["## 1. Gauged: CAMELS-H gauges against USGS", ""] + rows
     per_station = []
-    for name, (nse, scored) in mine.items():
+    for name, (nse, scored) in (mine or {}).items():
         for lead in LEADS:
             for gi, st in enumerate(names):
                 per_station.append(dict(method=name, lead_h=lead, station=st, nse=nse[lead // 6 - 1, gi] if scored[lead // 6 - 1, gi] else np.nan))
@@ -458,7 +472,7 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
             full = old_u.setdefault(method, np.full((P.HORIZON, gauges.count), np.nan))
             index = pd.Index(names).get_indexer(stations)
             full[:, index] = np.where(np.isfinite(nse), nse, full[:, index])
-    held = splits.gauge_folds(a.scheme, gauges, network) > 0
+    held = np.isin(splits.gauge_folds(a.scheme, gauges, network), a.loaded_folds)
     for label, prefix in BASELINES:
         for rain in a.rains:
             if f"{prefix}+{rain}" in old_u:
@@ -472,7 +486,7 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     regulated, groups = regulation(network, gauges)
     lines += ["", "By dams (days 1-5, GEFS rain):", "", f"| protocol | gauges | {a.label} | LSTM | NWM |", "|---|---|---:|---:|---:|"]
     for protocol, table_, lstm_nse, keep in (
-        ("gauged", mine, old.get("lstm+gefs"), np.ones(gauges.count, bool)),
+        (("gauged", mine, old.get("lstm+gefs"), np.ones(gauges.count, bool)),) if mine is not None else ()) + (
         ("ungauged", mine_u, old_u.get("lstm+gefs"), held),
     ):
         if protocol == "gauged" and lstm_nse is not None:

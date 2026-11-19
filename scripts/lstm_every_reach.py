@@ -13,6 +13,10 @@ own, so the flow history is hidden everywhere (the LSTM was trained with 10% hid
 at the few gauge reaches of the all-gauge model that the new model sees.
 
   torchrun --standalone --nproc_per_node 4 scripts/lstm_every_reach.py
+
+LSTM-AS (ladder L4: area-scaled output, antecedent inputs) runs the same way with
+``--model "models/attr/ladder_L4_s1{fold}/best.pt" --out models/attr/ladder_L4_s1_reaches``: the output is specific
+discharge times each reach's basin area, and the basin-mean antecedent storage is appended to the attributes.
 Output: models/gefs_lstm_reaches/metrics.npz ({metric}/gefs, {metric}/aorc [lead, reach] for
 NSE, KGE and its parts, RMSE and peak errors; issues).
 """
@@ -58,9 +62,10 @@ def load_lstm(path, k, device):
     withheld = (c.get("arguments", {}).get("holdout_fold") or 0)
     if withheld != k:
         raise ValueError(f"{path} was trained with fold {withheld} withheld, not {k}")
-    model = ForecastLSTM(hidden=c["hidden"], dropout=c["dropout"], horizon=P.HORIZON)
+    model = ForecastLSTM(static=c.get("static_dim", 48), hidden=c["hidden"], dropout=c["dropout"], horizon=P.HORIZON)
     model.load_state_dict(state["model"])
-    return model.to(device).eval(), c["flow_mean"], c["flow_std"], c["rain_hours"] // 6
+    return (model.to(device).eval(), c["flow_mean"], c["flow_std"], c["rain_hours"] // 6,
+            bool(c.get("area_output")), bool(c.get("antecedent")))
 
 
 def raw(z, mean, std):
@@ -102,12 +107,14 @@ class Inputs:
         return (self.mean @ both).view(n, P.HORIZON, 2)
 
 
-def forecast(model, mean, std, history, static, rain, index):
-    """Raw flow [lead, len(index)] of the reaches ``index`` from one LSTM."""
+def forecast(model, mean, std, history, static, rain, index, scale=None):
+    """Raw flow [lead, len(index)] of the reaches ``index`` from one LSTM. ``scale`` [reach]: basin area / 21.6 for an
+    LSTM whose output is specific discharge (area_output)."""
     out = []
     for part in index.split(CHUNK):
         z = model(history[part], static[part], rain[part])
-        out.append(raw(z.T, mean, std))
+        flow = raw(z.T, mean, std)
+        out.append(flow * scale[part].double()[None] if scale is not None else flow)
     return torch.cat(out, dim=1)
 
 
@@ -144,6 +151,7 @@ def run(a, rank, world, device):
     issues, every_reach = test_issues(s, nwm, reach_nwm.days(), a.limit)
     mine = sorted(every_reach)[rank::world]
     inputs = Inputs(s, device)
+    scale = torch.as_tensor(network.basin_area, dtype=torch.float32, device=device) / 21.6  # specific discharge -> m3/s
     tags = ("gefs", "aorc")
     acc = {t: Accumulator(network.n, device) for t in tags}
     began = time.perf_counter()
@@ -161,12 +169,16 @@ def run(a, rank, world, device):
                 "gefs": inputs.rain(sample["weather"], sample["valid"], s.rain.get("gefs", day)),
                 "aorc": inputs.rain(sample["weather"], sample["valid"]),
             }
+            with_antecedent = torch.cat([inputs.static, inputs.mean @ torch.as_tensor(sample["antecedent"], device=device)], dim=1)
             for tag in tags:
                 composite = torch.zeros(P.HORIZON, network.n, dtype=torch.float64, device=device)
-                for k, (model, mean, std, steps) in models.items():
+                for k, (model, mean, std, steps, per_area, antecedent) in models.items():
                     if steps != P.HORIZON:
                         raise ValueError("The LSTM was trained with rain to another lead")
-                    composite[:, index[k]] = forecast(model, mean, std, history, inputs.static, rains[tag], index[k])
+                    composite[:, index[k]] = forecast(
+                        model, mean, std, history, with_antecedent if antecedent else inputs.static, rains[tag], index[k],
+                        scale if per_area else None,
+                    )
                 acc[tag].add(composite, torch.nan_to_num(retro).double(), mask)
             if rank == 0 and position % 10 == 0:
                 print(f"issue {position + 1}/{len(mine)} per process; {(time.perf_counter() - began) / 60:.1f} min", flush=True)

@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from . import paths as P
+from .channel import ManningRouter
 
 EPS = 0.01  # m3/s in log ratios
 STEP_INPUTS = 8 + 8 + 1 + 2 + 2 + 2  # weather, validity, future, season, own gauge, owner gauge
@@ -322,9 +323,13 @@ class HydroModel(nn.Module):
     discharge of the visible gauge owning its basin (nor its area ratio to it); "routing": the
     learned travel-time kernels become a fixed instantaneous sum over the basin."""
 
-    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False, head=None, off=()):
+    def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False, head=None, off=(), router="kernel", insert=False):
         super().__init__()
         off = tuple(sorted(set(off)))
+        if router not in ("kernel", "manning"):
+            raise ValueError(f"Unknown router {router}")
+        if insert and router != "manning":
+            raise ValueError("Gauge-flow insertion needs the Manning router")
         if set(off) - set(ABLATIONS):
             raise ValueError(f"Unknown ablations {set(off) - set(ABLATIONS)}")
         self.config = dict(
@@ -340,13 +345,22 @@ class HydroModel(nn.Module):
             self.config["head"] = head  # GaugeHead settings
         if off:
             self.config["off"] = list(off)
+        if router != "kernel":
+            self.config["router"] = router  # channel.ManningRouter
+        if insert:
+            self.config["insert"] = True  # gauge-flow insertion (channel module docstring)
         self.off = set(off)
         self.trunk = Trunk(hidden, channels, graph_layers, mixing="mixing" not in self.off)
         self.simulation = nn.Linear(channels, 1)
         self.observed = nn.Linear(channels, 1)
         nn.init.zeros_(self.observed.weight)
         nn.init.zeros_(self.observed.bias)
-        self.router = Router(groups, delay, learned="routing" not in self.off)
+        if router == "manning":
+            if "routing" in self.off:
+                raise ValueError("The routing ablation is a kernel-router setting")
+            self.router = ManningRouter()
+        else:
+            self.router = Router(groups, delay, learned="routing" not in self.off)
         self.head = GaugeHead(**(head or {}))
         self.lead = nn.Embedding(P.HORIZON, 16)
         if quantiles:
@@ -397,7 +411,24 @@ class HydroModel(nn.Module):
         inflow = (0.5 * F.softplus(self.simulation(h).float()[..., 0])) * b["area"][:, None] / 21.6
         delta = 2 * torch.tanh(self.observed(h).float()[..., 0])
         q = inflow * torch.exp(delta)
+        if isinstance(self.router, ManningRouter):  # travel times at this sample's flows
+            self.router.prepare(self.router.reference_flow(inflow))
         return dict(sim=self.router(inflow), observed=self.router(q), gauge=self.router(q, gauges_only=True), delta=delta)
+
+    def insertion(self, b, routed_full, forecast, shown):
+        """Gauge-flow insertion (``channel`` docstring): corrections [G, F] at visible gauges, the observed flow minus the
+        routed flow before the issue and the gauge forecast minus the routed flow after it; routed down the network.
+        ``routed_full`` [G, F] routed observed head at the gauges, ``forecast`` [G, S] the gauge forecast, ``shown`` [G]
+        visible gauges. Returns the routed corrections at every reach [n, F] and at every gauge [G, F] (a gauge never
+        receives its own correction)."""
+        observed = b["observed"][P.HISTORY - P.PAST : P.WINDOW].T  # [G, F] on the inflow window
+        past = torch.arange(P.FLOW_STEPS, device=observed.device) < P.PAST
+        known = torch.isfinite(observed) & past[None] & shown[:, None]
+        delta = torch.where(known, torch.nan_to_num(observed) - routed_full, torch.zeros_like(routed_full))
+        lead = slice(P.PAST, P.FLOW_STEPS)
+        ahead = (forecast[:, P.INNOVATION :] - routed_full[:, lead]) * shown[:, None].float()
+        delta = torch.cat([delta[:, : P.PAST], ahead], dim=1)
+        return self.router(delta, op="insert"), self.router(delta, op="insert_gauges")
 
     def without_broadcast(self, b):
         """Batch ``b`` with the owner-gauge inputs (``samples.Device.assemble``: the last two step channels, the
@@ -449,6 +480,7 @@ class HydroModel(nn.Module):
         visible, reach = b["visible"], b["gauge_reach"]
         out["routed_gauge"] = routed  # observed head at every gauge, without its own history
         gauge = routed
+        insert = self.config.get("insert") and bool(visible.any())
         if visible.any():
             shown = torch.nonzero(visible)[:, 0]
             lead = slice(P.INNOVATION, P.SCORED)
@@ -467,6 +499,13 @@ class HydroModel(nn.Module):
             )
             gauge = routed.clone()
             gauge[shown, lead] = routed[shown, lead] * torch.exp(correction)
+        if insert:  # visible gauges correct every reach and every other gauge below them
+            to_reaches, to_gauges = self.insertion(b, flows["gauge"], gauge, visible.bool())
+            out["observed"] = (flows["observed"] + to_reaches)[:, scored].clamp_min(0)
+            after = (flows["gauge"] + to_gauges)[:, scored].clamp_min(0)
+            out["routed_gauge"] = after
+            gauge = torch.where(visible.bool()[:, None] & (torch.arange(P.SCORED, device=after.device) >= P.INNOVATION)[None],
+                                gauge, after)
         out["gauge"] = gauge
         flags = torch.stack(
             [visible.float(), b["owned"][reach], torch.log1p(gauge[:, -1].detach()) / 5], dim=-1
@@ -592,4 +631,4 @@ def build_model(config, **extra):
         return AttentionGNN(*args, **kwargs, **config["attention"], **extra)
     if kind == "lumped":
         return LumpedModel(*args, **kwargs)
-    return HydroModel(*args, **kwargs, off=config.get("off", ()))
+    return HydroModel(*args, **kwargs, off=config.get("off", ()), router=config.get("router", "kernel"), insert=config.get("insert", False))

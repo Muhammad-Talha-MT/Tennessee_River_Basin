@@ -51,14 +51,18 @@ SEED_VARIANTS=${SEED_VARIANTS:-A0 A5}
 mkdir -p "$A" "$LOGS"
 
 say() { echo "[$(date '+%F %T')] $*"; }
-claim() {  # claim OUT for this Slurm job (an atomic mkdir); a claim of a job that is gone is taken over
-  local out=$1 owner
+claim() {  # claim OUT for this job (an atomic mkdir); a claim whose owner is gone (Slurm job ended, local process dead) is taken over
+  local out=$1 owner me
+  me=${SLURM_JOB_ID:-local:$$}
   mkdir -p "$(dirname "$out")"
-  if mkdir "$out.claim" 2>/dev/null; then echo "${SLURM_JOB_ID:-local}" >"$out.claim/owner"; return 0; fi
+  if mkdir "$out.claim" 2>/dev/null; then echo "$me" >"$out.claim/owner"; return 0; fi
   owner=$(cat "$out.claim/owner" 2>/dev/null)
-  if [ -n "$owner" ] && [ "$owner" != local ] && command -v squeue >/dev/null && [ -z "$(squeue -h -j "$owner" 2>/dev/null)" ]; then
-    rm -rf "$out.claim"; mkdir "$out.claim" 2>/dev/null && { echo "${SLURM_JOB_ID:-local}" >"$out.claim/owner"; return 0; }
-  fi
+  case $owner in
+    local:*) kill -0 "${owner#local:}" 2>/dev/null && return 1 ;;
+    "") return 1 ;;
+    *) command -v squeue >/dev/null && [ -z "$(squeue -h -j "$owner" 2>/dev/null)" ] || return 1 ;;
+  esac
+  rm -rf "$out.claim"; mkdir "$out.claim" 2>/dev/null && { echo "$me" >"$out.claim/owner"; return 0; }
   return 1
 }
 step() {  # step OUT LOG command...: run unless OUT/DONE or claimed by another job; mark DONE or FAILED
@@ -108,6 +112,10 @@ variant_args() {  # the stage-B arguments of a variant
     A4) echo "--init $M/gefs_hydro_A/best.pt --nwm-weight 0 ${B_UPDATES[*]}" ;;
     A5) echo "--lumped --init $A/lumped_A/best.pt ${B_UPDATES[*]}" ;;
     A6) echo "--lumped --no-nwm ${SCRATCH[*]}" ;;
+    R0) echo "--graph-layers 0 --init $A/nograph_A/best.pt ${B_UPDATES[*]}" ;;  # routed per reach, no graph layers (own stage A)
+    M0) echo "--router manning --insert --init $A/manning_A/best.pt ${B_UPDATES[*]}" ;;  # Manning routing + gauge-flow insertion
+    M1) echo "--router manning --init $A/manning_A/best.pt ${B_UPDATES[*]}" ;;  # M0 without insertion
+    M2) echo "--router manning --insert --graph-layers 0 --init $A/manning0_A/best.pt ${B_UPDATES[*]}" ;;  # M0 without graph layers
     *) echo "unknown variant $1" >&2; return 1 ;;
   esac
 }
@@ -121,6 +129,8 @@ train() {  # train NAME GPU SEED [train arguments]
 train_as() {  # train_as NAME VARIANT SEED FOLD GPU [extra arguments, e.g. --scheme blocked, --keep 0.25]
   local name=$1 v=$2 seed=$3 fold=$4 gpu=$5; shift 5
   [ "$v" = A5 ] && { wait_for "$A/lumped_A" || return 1; }
+  [ "$v" = R0 ] && { wait_for "$A/nograph_A" || return 1; }
+  case $v in M0 | M1) wait_for "$A/manning_A" || return 1 ;; M2) wait_for "$A/manning0_A" || return 1 ;; esac
   # shellcheck disable=SC2046
   train "$name" "$gpu" "$seed" "${B_COMMON[@]}" $(variant_args "$v") --fold "$fold" "$@"
 }
@@ -131,6 +141,39 @@ train_variant() {  # train_variant VARIANT SEED FOLD GPU: the Exp.1 model of tha
 
 lumped_stage_a() {  # the lumped model's NWM pre-training, as models/gefs_hydro_A for the GNN
   train lumped_A "$1" 1 --stage A --lumped --accumulate 8 --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000 --resume --workers "$TRAIN_WORKERS"
+}
+
+nograph_stage_a() {  # R0's NWM pre-training: the GNN's stage A with no graph layers (routing kept)
+  train nograph_A "$1" 1 --stage A --graph-layers 0 --accumulate 8 --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000 --resume --workers "$TRAIN_WORKERS"
+}
+
+train_all_gpus() {  # train_all_gpus NAME [train arguments]: one run over every GPU (torchrun), 8 samples per update
+  local name=$1 list; shift
+  list=$(IFS=,; echo "${GPUS[*]}")
+  step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="$list" HIP_VISIBLE_DEVICES="$list" \
+    "$PY" -W ignore::UserWarning -m torch.distributed.run --rdzv-backend c10d --rdzv-endpoint 127.0.0.1:0 --local-addr 127.0.0.1 \
+    --nproc_per_node "${#GPUS[@]}" -m tva_flood.hydro.train --out "$A/$name" --seed 1 --accumulate $((8 / ${#GPUS[@]})) "$@"
+}
+
+train_as_all() {  # train_as_all NAME VARIANT SEED FOLD [extra arguments]: train_as, one run over every GPU (2 samples x 4 GPUs x 1 = 8 per update; same sample list as one GPU)
+  local name=$1 v=$2 seed=$3 fold=$4; shift 4
+  case $v in M0 | M1) wait_for "$A/manning_A" || return 1 ;; M2) wait_for "$A/manning0_A" || return 1 ;; esac
+  local common=() skip=0 x
+  for x in "${B_COMMON[@]}"; do  # drop --accumulate N: train_all_gpus sets it
+    if [ $skip = 1 ]; then skip=0; elif [ "$x" = --accumulate ]; then skip=1; else common+=("$x"); fi
+  done
+  # shellcheck disable=SC2046
+  train_all_gpus "$name" "${common[@]}" $(variant_args "$v") --fold "$fold" "$@"
+}
+
+MANNING_A=(--stage A --router manning --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000 --resume --workers "$TRAIN_WORKERS")
+
+manning_stage_a() {  # the Manning-router stage A with 3 graph layers, on every GPU (same budget as models/gefs_hydro_A)
+  train_all_gpus manning_A "${MANNING_A[@]}" --graph-layers 3
+}
+
+manning0_stage_a() {  # manning0_stage_a GPU: the same without graph layers, one GPU (8 samples per update, the same list)
+  train manning0_A "$1" 1 "${MANNING_A[@]}" --graph-layers 0 --accumulate 8
 }
 
 # ---- evaluation ----------------------------------------------------------------------------------------------
@@ -172,9 +215,48 @@ lstm_benchmark() {  # lstm_benchmark SEED FOLD (CPU, 12 processes; as models/gef
   wait_for "$A/lstm_matched_s${seed}$s" || return 1
   [ -f "$A/$name/DONE" ] || rm -rf "$A/$name"
   step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=2 \
-    "$PY" -m torch.distributed.run --standalone --nproc_per_node 12 -m tva_flood evaluate-benchmark \
+    "$PY" -m torch.distributed.run --rdzv-backend c10d --rdzv-endpoint 127.0.0.1:0 --local-addr 127.0.0.1 --nproc_per_node "${BENCH_PROCS:-12}" -m tva_flood evaluate-benchmark \
     --device cpu --preparation "$TEST" --array-cache "${TEST}_arrays" --gauges "$GAUGES" \
     --gefs "$OPERATIONAL" --out "$A/$name" --lstm "lstm=$A/lstm_matched_s${seed}$s/best.pt" "${extra[@]}"
+}
+
+# ---- the addition ladder: the matched LSTM plus one ingredient of the graph models at a time -------------------------------
+# L1 area-scaled output (log specific discharge x area), L2 NSE* loss, L3 antecedent-storage inputs, L4 all three. Everything else
+# is the matched LSTM (history hidden in 57.5%, selection on shown + hidden skill). One seed unless LADDER_SEEDS says otherwise.
+ladder_flags() {
+  case $1 in
+    L1) echo "--area-output" ;;
+    L2) echo "--loss nse" ;;
+    L3) echo "--antecedent" ;;
+    L4) echo "--area-output --loss nse --antecedent" ;;
+    *) echo "unknown ladder variant $1" >&2; return 1 ;;
+  esac
+}
+ladder_train() {  # ladder_train VARIANT SEED FOLD GPU
+  local v=$1 seed=$2 fold=$3 gpu=$4 name extra=() flags
+  name=ladder_${v}_s${seed}$(suffix "$fold")
+  [ "$fold" -gt 0 ] && extra=(--holdout-fold "$fold" --folds 5)
+  read -r -a flags <<<"$(ladder_flags "$v")"
+  [ -f "$A/$name/DONE" ] || rm -rf "$A/$name"
+  step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="$gpu" \
+    "$PY" -u -m tva_flood train-lstm --out "$A/$name" --seed "$seed" --gauges "$GAUGES" \
+    --forecast-rain "$REFORECAST" --forecast-fraction 1 --unknown-rain-prob 0 --rain-cut-prob 0 \
+    --rain-hours 240 --validation-rain "$REFORECAST" --validation-gauges camelsh --validation-split \
+    --sample-budget 3300807 --evaluations 10 --min-count 100 \
+    --batch-size 48 --lr 5e-4 --dropout 0 --balanced \
+    --history-hide 0.575 --validation-hidden "${flags[@]}" "${extra[@]}"
+}
+ladder_benchmark() {  # ladder_benchmark VARIANT SEED FOLD (CPU)
+  local v=$1 seed=$2 fold=$3 s name extra=()
+  s=$(suffix "$fold")
+  name=ladder_${v}_s${seed}_bench$s
+  [ "$fold" -gt 0 ] && extra=(--holdout-fold "$fold" --folds 5)
+  wait_for "$A/ladder_${v}_s${seed}$s" || return 1
+  [ -f "$A/$name/DONE" ] || rm -rf "$A/$name"
+  step "$A/$name" "$LOGS/$name.log" env CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=2 \
+    "$PY" -m torch.distributed.run --rdzv-backend c10d --rdzv-endpoint 127.0.0.1:0 --local-addr 127.0.0.1 --nproc_per_node "${BENCH_PROCS:-6}" -m tva_flood evaluate-benchmark \
+    --device cpu --preparation "$TEST" --array-cache "${TEST}_arrays" --gauges "$GAUGES" \
+    --gefs "$OPERATIONAL" --out "$A/$name" --lstm "lstm=$A/ladder_${v}_s${seed}$s/best.pt" "${extra[@]}"
 }
 
 # ---- the GPU queue -------------------------------------------------------------------------------------------
@@ -240,14 +322,31 @@ case $PHASE in
     wait "$gpu_jobs" "$cpu_jobs"
     report phase1
     say "phase0 finished: $ROOT/figures/attribution/{phase1,leakage,conservation}/report.md" ;;
-  phase1)
+  ladder)  # trainings in the GPU queue; two CPU scoring streams beside it (BENCH_PROCS processes each)
+    LADDER_VARIANTS=${LADDER_VARIANTS:-L1 L4 L2 L3}; LADDER_SEEDS=${LADDER_SEEDS:-1}
+    for stream in 0 1; do
+      (i=0; for seed in $LADDER_SEEDS; do for v in $LADDER_VARIANTS; do for fold in 0 1 2 3 4 5; do
+         i=$((i + 1)); [ $((i % 2)) -eq "$stream" ] && ladder_benchmark "$v" "$seed" "$fold"
+       done; done; done) &
+    done
+    {
+      for seed in $LADDER_SEEDS; do for v in $LADDER_VARIANTS; do for fold in 1 2 3 4 5 0; do echo "ladder_train $v $seed $fold \$GPU"; done; done; done
+    } | run_queue
+    wait
+    report phase1
+    say "ladder finished: $ROOT/figures/attribution/phase1/report.md" ;;
+  bench)  # only the matched-LSTM scoring (CPU): SEEDS selects the seeds, e.g. one process per seed
+    for seed in ${SEEDS:-1 2 3}; do for fold in 0 1 2 3 4 5; do lstm_benchmark "$seed" "$fold"; done; done ;;
+  phase1)  # held-out folds (1-5) first, in the order of decisiveness; the all-gauge models (fold 0) and the evaluations last
     {
       echo "lumped_stage_a \$GPU"
-      for fold in 0 1 2 3 4 5; do echo "train_variant A3 1 $fold \$GPU"; done
-      for fold in 0 1 2 3 4 5; do echo "train_variant A6 1 $fold \$GPU"; done
-      for fold in 0 1 2 3 4 5; do echo "train_variant A1 1 $fold \$GPU"; done
-      for fold in 0 1 2 3 4 5; do echo "train_variant A5 1 $fold \$GPU"; done
-      for v in A1 A5 A6 A3; do echo "evaluate_variant $v 1 \$GPU"; done
+      for fold in 1 2 3; do echo "train_variant A1 1 $fold \$GPU"; done
+      for fold in 1 2 3 4 5; do echo "train_variant A5 1 $fold \$GPU"; done
+      for fold in 1 2 3 4 5; do echo "train_variant A6 1 $fold \$GPU"; done
+      for fold in 4 5; do echo "train_variant A1 1 $fold \$GPU"; done
+      for fold in 1 2 3 4 5; do echo "train_variant A3 1 $fold \$GPU"; done
+      for v in A5 A1 A6 A3; do echo "train_variant $v 1 0 \$GPU"; done
+      for v in A5 A1 A6 A3; do echo "evaluate_variant $v 1 \$GPU"; done
     } | run_queue
     report phase1 leakage
     say "phase1 finished: $ROOT/figures/attribution/phase1/report.md" ;;
@@ -280,6 +379,98 @@ case $PHASE in
     } | run_queue
     report blocked coverage transfer
     say "phase2 finished: $ROOT/figures/attribution/{blocked,coverage,transfer}/report.md" ;;
+  rest)  # all remaining trainings in one queue ordered by value: blocked folds, seeds (cheap models first), coverage, A4/A2.
+         # The evaluations are done by "rest_eval", started beside it, as each group finishes.
+    for v in A0 A5; do  # coverage 0%: the stage-A model as every fold model, seeing no gauge
+      stage_a=$M/gefs_hydro_A/best.pt
+      [ "$v" = A5 ] && stage_a=$A/lumped_A/best.pt
+      if [ -z "${DRY_RUN:-}" ] && [ ! -f "$A/S2_${v}_k000_f5/DONE" ]; then
+        "$PY" scripts/attribution_analysis.py zero-coverage --stage-a "$stage_a" --out-template "$A/S2_${v}_k000_f{k}" >>"$LOGS/rest.log" 2>&1
+      fi
+    done
+    {
+      for v in A0 A5; do for b in 1 2 3; do echo "train_as S1_${v}_s1_b$b $v 1 $b \$GPU --scheme blocked"; done; done
+      for seed in 2 3; do for v in A5 A6; do for fold in 1 2 3 4 5 0; do echo "train_variant $v $seed $fold \$GPU"; done; done; done
+      for seed in 2 3; do for fold in 1 2 3 4 5 0; do echo "train_variant A0 $seed $fold \$GPU"; done; done
+      for keep in 025 050; do for v in A5 A0; do for fold in 1 2 3 4 5; do
+        echo "train_as S2_${v}_k${keep}_f$fold $v 1 $fold \$GPU --keep 0.${keep#0} --keep-seed 1"
+      done; done; done
+      for v in A4 A2; do for fold in 1 2 3 4 5 0; do echo "train_variant $v 1 $fold \$GPU"; done; done
+    } | run_queue
+    say "rest trainings finished" ;;
+  rest_eval)  # evaluates each group as soon as its trainings are DONE; shares a GPU with the training queue (about 15 GB)
+    G=-1; nextg() { G=$(( (G + 1) % 4 )); }
+    for v in A0 A5; do
+      nextg; wait_for "$A/S1_${v}_s1_b1" "$A/S1_${v}_s1_b2" "$A/S1_${v}_s1_b3" && evaluate "eval_S1_${v}_s1" "$G" "$A/${v}_s1/best.pt" "$A/S1_${v}_s1_b{k}/best.pt" "S1_$v" "${FAST[@]}"
+    done
+    for seed in 2 3; do for v in A5 A6; do nextg; evaluate_variant "$v" "$seed" "$G" "${FAST[@]}"; done; done
+    for seed in 2 3; do nextg; evaluate_variant A0 "$seed" "$G" "${FAST[@]}"; done
+    for v in A5 A0; do for keep in 000 025 050; do
+      nextg; wait_for "$A/S2_${v}_k${keep}_f1" "$A/S2_${v}_k${keep}_f2" "$A/S2_${v}_k${keep}_f3" "$A/S2_${v}_k${keep}_f4" "$A/S2_${v}_k${keep}_f5" &&
+        evaluate "eval_S2_${v}_k$keep" "$G" "$A/${v}_s1/best.pt" "$A/S2_${v}_k${keep}_f{k}/best.pt" "S2_${v}_$keep" "${FAST[@]}"
+    done; done
+    for v in A4 A2; do nextg; evaluate_variant "$v" 1 "$G"; done
+    report phase1 blocked coverage transfer
+    say "rest_eval finished: $ROOT/figures/attribution/{phase1,blocked,coverage,transfer}/report.md" ;;
+  final)  # the experiments kept for the paper: blocked folds (A0, A5) and seeds 2 and 3 (A5, A6, A0); evaluations in "final_eval"
+    {
+      for v in A0 A5; do for b in 1 2 3; do echo "train_as S1_${v}_s1_b$b $v 1 $b \$GPU --scheme blocked"; done; done
+      for seed in 2 3; do for v in A5 A6; do for fold in 1 2 3 4 5 0; do echo "train_variant $v $seed $fold \$GPU"; done; done; done
+      for seed in 2 3; do for fold in 1 2 3 4 5 0; do echo "train_variant A0 $seed $fold \$GPU"; done; done
+    } | run_queue
+    say "final trainings finished" ;;
+  final_eval)
+    G=-1; nextg() { G=$(( (G + 1) % 4 )); }
+    for v in A0 A5; do
+      nextg; wait_for "$A/S1_${v}_s1_b1" "$A/S1_${v}_s1_b2" "$A/S1_${v}_s1_b3" && evaluate "eval_S1_${v}_s1" "$G" "$A/${v}_s1/best.pt" "$A/S1_${v}_s1_b{k}/best.pt" "S1_$v" "${FAST[@]}"
+    done
+    for seed in 2 3; do for v in A5 A6; do nextg; evaluate_variant "$v" "$seed" "$G" "${FAST[@]}"; done; done
+    for seed in 2 3; do nextg; evaluate_variant A0 "$seed" "$G" "${FAST[@]}"; done
+    report phase1 blocked
+    say "final_eval finished: $ROOT/figures/attribution/{phase1,blocked}/report.md" ;;
+  next)  # round 2 (docs/ATTRIBUTION.md): R0 (routing, no graph layers) and A1 on the blocked folds, R0 on the random folds
+    {
+      echo "nograph_stage_a \$GPU"
+      for v in A1 R0; do for b in 1 2 3; do echo "train_as S1_${v}_s1_b$b $v 1 $b \$GPU --scheme blocked"; done; done
+      for fold in 1 2 3 4 5 0; do echo "train_variant R0 1 $fold \$GPU"; done
+    } | run_queue
+    say "next trainings finished" ;;
+  next_eval)
+    G=-1; nextg() { G=$(( (G + 1) % 4 )); }
+    for v in A1 R0; do
+      nextg; wait_for "$A/S1_${v}_s1_b1" "$A/S1_${v}_s1_b2" "$A/S1_${v}_s1_b3" && evaluate "eval_S1_${v}_s1" "$G" "$A/${v}_s1/best.pt" "$A/S1_${v}_s1_b{k}/best.pt" "S1_$v" "${FAST[@]}"
+    done
+    nextg; evaluate_variant R0 1 "$G"
+    report phase1 blocked
+    say "next_eval finished" ;;
+  routing)  # Manning routing (hydro.channel): stage A on every GPU, then M0 (+ insertion), M2 (no graph layers), M1 (no insertion)
+    manning_stage_a
+    {
+      echo "manning0_stage_a \$GPU"
+      for fold in 1 2 3 4 5 0; do echo "train_variant M0 1 $fold \$GPU"; done
+      for b in 1 2 3; do echo "train_as S1_M0_s1_b$b M0 1 $b \$GPU --scheme blocked"; done
+      for fold in 1 2 3 4 5 0; do echo "train_variant M2 1 $fold \$GPU"; done
+      for b in 1 2 3; do echo "train_as S1_M2_s1_b$b M2 1 $b \$GPU --scheme blocked"; done
+      for fold in 1 2 3 4 5 0; do echo "train_variant M1 1 $fold \$GPU"; done
+    } | run_queue
+    say "routing trainings finished" ;;
+  routing_seq)  # the M0/M2/M1 trainings one run at a time over every GPU; a run resumes from its resume.pt
+    seq_job() { train_as_all "$@" || say "job failed: $*"; }
+    for fold in 1 2 3 4 5 0; do seq_job "M0_s1$(suffix $fold)" M0 1 $fold; done
+    for b in 1 2 3; do seq_job "S1_M0_s1_b$b" M0 1 $b --scheme blocked; done
+    for fold in 1 2 3 4 5 0; do seq_job "M2_s1$(suffix $fold)" M2 1 $fold; done
+    for b in 1 2 3; do seq_job "S1_M2_s1_b$b" M2 1 $b --scheme blocked; done
+    for fold in 1 2 3 4 5 0; do seq_job "M1_s1$(suffix $fold)" M1 1 $fold; done
+    say "routing trainings finished" ;;
+  routing_eval)  # M0 in full (every-reach and realized-rain protocols too); M2 and M1 on the gauges
+    G=-1; nextg() { G=$(( (G + 1) % 4 )); }
+    nextg; evaluate_variant M0 1 "$G"
+    nextg; wait_for "$A/S1_M0_s1_b1" "$A/S1_M0_s1_b2" "$A/S1_M0_s1_b3" && evaluate eval_S1_M0_s1 "$G" "$A/M0_s1/best.pt" "$A/S1_M0_s1_b{k}/best.pt" S1_M0 "${FAST[@]}"
+    nextg; evaluate_variant M2 1 "$G" "${FAST[@]}"
+    nextg; wait_for "$A/S1_M2_s1_b1" "$A/S1_M2_s1_b2" "$A/S1_M2_s1_b3" && evaluate eval_S1_M2_s1 "$G" "$A/M2_s1/best.pt" "$A/S1_M2_s1_b{k}/best.pt" S1_M2 "${FAST[@]}"
+    nextg; evaluate_variant M1 1 "$G" "${FAST[@]}"
+    report phase1 blocked
+    say "routing_eval finished: $ROOT/figures/attribution/{phase1,blocked}/report.md" ;;
   extra)
     {
       for v in A2 A4; do for fold in 0 1 2 3 4 5; do echo "train_variant $v 1 $fold \$GPU"; done; done

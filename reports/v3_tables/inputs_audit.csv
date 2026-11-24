@@ -1,0 +1,19 @@
+input,"M0, M1, M2",LSTM,matched
+Weather before the issue,144 steps (36 days) of 8 AORC variables + 8 validity flags per reach (reach scale),"120 steps (30 days) of the same 8 variables + 8 validity flags, basin-mean over the gauge's upstream basin",same variables and source; different window length and spatial aggregation
+Rain after the issue,GEFSv12 control precipitation to 240 h (40 steps) per reach; the other 7 weather variables are unknown and flagged invalid; known-rain flag per step,"GEFSv12 control rain + known-share, basin-mean, 40 leads (2 channels); reforecast in training, operational at test",same forecast source and horizon (samples.py:build; lstm_baseline.py:batch)
+Static attributes,48 per reach (REACH_INPUTS),48 basin-mean (static_dim 55 = 48 + 7),"same attribute set, reach vs basin mean"
+Antecedent storage,7 per reach (REACH_INPUTS),"7 basin-mean, appended to the attributes (--antecedent)",same features
+Season,sin and cos of the day of year (2 step channels),none (no explicit season input),differs
+Own flow of the target gauge when it is withheld,"not available: gauge_view sets it to NaN and visible False, at every time (tests/test_hydro.py)",not available: history zeroed and flag 0 (fold models trained with that gauge removed),matched
+Own flow of a visible gauge,"log flow + shown flag at the gauge's own reach (2 step channels), history only; the gauge head reads the last 120 steps (30 days; HydroModel.forward)",flow + flag in the 120-step history,matched
+Flow of other gauges,"visible gauges only, before the issue: the owner gauge's specific discharge + validity (2 step channels) and the area ratio + flag (2 reach inputs) on every reach inside the owner's basin; carried by the graph layers (M0, M1: 3; M2: 0) and, in M0 and M2 only, by insertion",none,"DIFFERS: the network models see other gauges, the LSTM does not (by design)"
+Network structure,"river graph with 60,267 links over 58,834 reaches; Manning router inputs per reach (CHANNEL_INPUTS = 53)",none (lumped basin mean),differs by design
+NWM,"stage A pretraining on NWM retrospective flows at every reach (5000 updates), plus a prior term (nwm_weight 0.3) in stage B; not an input at test","not used (no NWM pretraining, no NWM input)",DIFFERS: the LSTM has no NWM pretraining
+Output,"area-scaled runoff routed down the network; a visible gauge's forecast is the gauge head's; any other reach is routed flow (+ insertion in M0, M2)",specific discharge x basin area / 21.6 (area_output = True),matched at the gauge (same units: flow in m3/s)
+Training loss,nse-q: NSE* on gauge and routed forecasts + pinball tail (weight 1.0) + NWM prior (weight 0.3),"nse on gauge flow; high-flow weight 2.0, raw weight 1.0",differs
+Gauge visibility in training,15% of samples show no gauge; otherwise each eligible gauge is shown with probability 0.5 (train.py:107-108),own history hidden in 57.5% of samples,"comparable intent, different mechanism"
+Training volume (stage B),"3000 updates x 8 whole-network samples, lr 0.0003","68,767 updates x 48 (issue, gauge) pairs, lr 0.0005",differs
+Model selection,"2019 validation: mean of gauged and hidden median NSE at training gauges, leads 24-120 h","training.selection: mean over 6-120 h of median NSE over camelsh gauges, 00Z validation issues; GEFS reforecast rain","similar (validation year 2019, median NSE over gauges)"
+Recurrent size,LSTM hidden 128 -> 32 channels,LSTM hidden 256,differs
+Parameters,"M0 932,347; M1 932,347; M2 919,675","810,369",differs
+Step inputs / reach inputs (network models),"23 step channels, 57 reach inputs",18 dynamic channels + 55 static,-

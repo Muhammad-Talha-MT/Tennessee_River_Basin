@@ -1,0 +1,23 @@
+protocol,contrast,sign_changes
+Gauged,M0 - LSTM,none
+Gauged,M0 - NWM,none
+Gauged,M0 - M2,none
+Gauged,M0 - M1,none
+Gauged,M1 - LSTM,none
+Gauged,M2 - LSTM,none
+Random hold-out,M0 - LSTM,96->120 h
+Random hold-out,M0 - NWM,none
+Random hold-out,M0 - M2,none
+Random hold-out,M1 - M4,none
+Random hold-out,M0 - M1,48->72 h
+Random hold-out,M1 - LSTM,96->120 h
+Random hold-out,M2 - LSTM,24->48 h
+Random hold-out,M4 - LSTM,none
+Blocked basins,M0 - LSTM,none
+Blocked basins,M0 - NWM,none
+Blocked basins,M0 - M2,none
+Blocked basins,M1 - M4,"24->48 h, 48->72 h, 72->96 h, 96->120 h"
+Blocked basins,M0 - M1,none
+Blocked basins,M1 - LSTM,none
+Blocked basins,M2 - LSTM,none
+Blocked basins,M4 - LSTM,none

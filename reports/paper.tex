@@ -1,0 +1,441 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Built on AGUJournalTemplate.tex (Sep-2025 agujournal2019 template).
+%
+% STATUS OF THIS DRAFT (21 Nov 2026)
+%   Written:      Section 1 (Introduction), Section 2 (Background and Related Work),
+%                 Section 3 (Study Area, Data, and Forecast Protocol),
+%                 Section 4 (Models and Experiments), Tables 1-2, Figures 1-3;
+%                 supplement.tex (Texts S1-S6, Tables S1-S5, Figures S1-S2)
+%   Placeholders: front matter, Sections 5-7, Open Research, Acknowledgments
+%
+% Sections 1, 2 and 4 contain no results; Section 3 numbers come from
+% reports/section3_facts.md and Section 4 from reports/section4_facts.md
+% (public data only; no TVA data or terminology). Results belong in Section 5,
+% the abstract and the key points.
+%
+% Comments beginning with "% VERIFY" mark statements the authors should check.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[draft]{agujournal2019}
+\usepackage{url} %this package should fix any errors with URLs in refs.
+\usepackage{lineno}
+\usepackage[inline]{trackchanges} %for better track changes. finalnew option will compile document with changes incorporated.
+\usepackage{soul}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\linenumbers
+
+\draftfalse
+
+% Justified text: the class calls \RaggedRight unconditionally (agujournal2019.cls,
+% line 115); restore full justification from ragged2e.
+\justifying
+
+% Figure placeholder: compiles even when a figure file is not yet in figures/.
+\newcommand{\figfile}[2]{\IfFileExists{#1}{\includegraphics[width=#2]{#1}}{\fbox{\parbox[c][4cm][c]{0.8\textwidth}{\centering\small [figure file \detokenize{#1} not found]}}}}
+% Placeholder for a citation that is not yet in references.bib.
+\newcommand{\todocite}[1]{[\textbf{cite #1}]}
+% Value still to be computed.
+\newcommand{\tbd}[1]{\textbf{[#1]}}
+
+\journalname{Water Resources Research}
+
+\begin{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  TITLE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\title{Does the River Network Help Forecast Streamflow at Unmonitored Reaches?}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  AUTHORS AND AFFILIATIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\authors{=list all authors here=}
+
+\affiliation{=number=}{=Affiliation Address=}
+
+\correspondingauthor{=name=}{=email address=}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% KEY POINTS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  Each must be 140 characters or fewer with no special characters or punctuation and must be complete sentences
+
+\begin{keypoints}
+\item enter point 1 here
+\item enter point 2 here
+\item enter point 3 here
+\end{keypoints}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%  ABSTRACT and PLAIN LANGUAGE SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% The abstract in Manuscript_GNN.docx predates the ablation results and should
+% be rewritten against the 19 Nov report before it is pasted here.
+
+\begin{abstract}
+[ enter your Abstract here ]
+\end{abstract}
+
+\section*{Plain Language Summary}
+[ enter your Plain Language Summary here or delete this section ]
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  BODY TEXT
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%=====================================================================
+\section{Introduction}
+\label{sec:intro}
+%=====================================================================
+
+Streamflow forecasts are needed along entire river networks, but discharge is measured at only a small and unrepresentative fraction of river reaches \cite{Krabbenhoft2022}. Flood warning, reservoir operation, and water management require forecasts several days ahead at locations that have never been gauged \cite{Pagano2014,Emerton2016}. Estimating flow at such locations is the long-standing problem of prediction in ungauged basins \cite{Sivapalan2003,Hrachowitz2013,Bloschl2013}, and it remains one of the unsolved problems of hydrology \cite{Bloschl2019}.
+
+Regional deep learning has changed what can be expected at ungauged locations. Long short-term memory (LSTM) networks trained jointly on many basins, with catchment attributes as inputs, are now among the most accurate rainfall--runoff models \cite{Kratzert2018,Kratzert2019hess}. They retain much of this accuracy in basins withheld from training \cite{Kratzert2019wrr,Arsenault2023} and have been used for real-time forecasting at global scale \cite{Nearing2024}. These models, however, are lumped. Each basin is treated as an independent unit with averaged forcing, so the model has no representation of how water moves along the river network, and it cannot use flow observed at a gauge upstream of the location being forecast.
+
+Network-aware models aim to remove this limitation. A river system can be represented as a directed graph of reaches, and graph neural networks (GNNs) exchange information between upstream and downstream neighbors through learned message passing \cite{Gilmer2017,Kipf2017}. Such models have been applied to streamflow and stream temperature \cite{Moshe2020,Jia2021,Sun2022}. A second line of work couples neural networks with differentiable channel routing, which moves runoff through the network according to physical transport equations \cite{Bindas2024,Song2025}. Both approaches share an intuitive expectation: a model that knows the river network should forecast better at unmonitored reaches, because water and information from measured parts of the network can reach them.
+
+The evidence for this expectation is mixed. Studies that varied the graph of a GNN flood forecaster found no benefit from the river topology in one case \cite{Kirschstein2024} and clear benefits under other formulations \cite{WangH2025,Mosaffa2026}. These studies differ in how the graph enters the model, and a network-aware model typically differs from its lumped benchmark in several ways at once: the spatial unit, the transport operator, the use of observations from other gauges, the inputs, and the training procedure. A skill difference between the two then reflects the whole system rather than the river network itself. Moreover, most evaluations use observed meteorology over the forecast period and score models at gauges that also contributed to training. Neither condition holds in operational forecasting at unmonitored reaches, where the precipitation forecast is the dominant source of error \cite{Cloke2009} and the target location has never been observed.
+
+In this study, we ask whether, and through which mechanism, the river network improves streamflow forecasts at unmonitored reaches. We develop a reach-scale forecasting model for the Tennessee River Basin in which the network can enter in three separable ways: learned message passing between reaches, physically based channel routing, and insertion of upstream gauge observations into the routed flow. Each mechanism can be removed while all other choices are held fixed. We compare the model and its ablations with a regional LSTM that uses the same meteorological products and predicts the same quantity, and with the operational National Water Model (NWM) forecast \cite{Cosgrove2024}. All models produce forecasts to a lead time of 10 days under archived operational precipitation forecasts \cite{Zhou2022,Guan2022}, and they are evaluated at gauges used in training, at gauges withheld at random, and at gauges in entire basins withheld from training. We address three research questions:
+\begin{enumerate}
+\item Does a reach-scale model that represents the river network forecast streamflow at unmonitored reaches better than a lumped LSTM with matched inputs and outputs?
+\item If so, does the benefit come from learned message passing or from physically based routing?
+\item Do observations at upstream gauges, carried downstream through the network, improve forecasts at ungauged reaches below them?
+\end{enumerate}
+For each question, we examine how the answer changes with forecast lead time and with the strictness of the spatial hold-out.
+
+The remainder of the paper is organized as follows. Section~\ref{sec:background} reviews related work. Section~\ref{sec:data} describes the study area, data, and forecast protocol, and Section~\ref{sec:methods} describes the models and experiments. Section~5 presents the results, Section~6 discusses their implications and limitations, and Section~7 concludes. Further detail on data, models, and tests is given in the Supporting Information.
+% NOTE: section numbers 5-7 are hard-coded until those sections exist; replace
+% with \ref once they are added.
+
+
+%=====================================================================
+\section{Background and Related Work}
+\label{sec:background}
+%=====================================================================
+
+\subsection{Regional Deep Learning for Ungauged Prediction}
+\label{sec:pub}
+
+Classical approaches to prediction in ungauged basins transfer calibrated parameters from gauged catchments by spatial proximity, by attribute similarity, or by regression on catchment attributes \cite{Merz2004,Oudin2008,Razavi2013,Samaniego2010}. Regional deep learning replaces this step with a single model trained on many basins \cite{Shen2018}. An LSTM trained on hundreds of basins with static attributes as inputs outperforms conceptual models calibrated basin by basin \cite{Kratzert2019hess}, and it remains competitive in basins excluded from training \cite{Kratzert2019wrr,Arsenault2023}. Such models typically predict runoff per unit area and rescale it by drainage area \cite{Kratzert2019hess}. Their skill decreases when contiguous regions are withheld rather than random basins \cite{Feng2021}, and when basins are regulated by reservoirs \cite{Ouyang2021}.
+
+These models are lumped. Predicting flow at every reach requires running the model separately for each upstream area, with nothing linking a reach to its neighbors. Coupling an LSTM with a routing scheme improves predictions in large and ungauged basins \cite{Yu2024}, which suggests that this lumped structure is a real limitation.
+
+\subsection{Representing the River Network in Learned Models}
+\label{sec:network}
+
+Two families of methods represent the river network explicitly. The first uses GNNs, which update each node from its neighbors through learned message passing \cite{Kipf2017,Gilmer2017,Hamilton2017}, often combined with a recurrent model in time \cite{Li2018,YuB2018}. In hydrology, HydroNets combined basin models along the river tree \cite{Moshe2020}, \citeA{Jia2021} used a recurrent graph network for streamflow and temperature in the Delaware River Basin, and \citeA{Sun2022} trained a GNN on a reach network using output from a process-based river model. Whether the river topology itself helps remains unresolved. \citeA{Kirschstein2024} found no benefit from river-based adjacency in flood forecasting. \citeA{WangH2025} attributed this to over-squashing \cite{Alon2021} and reported gains once the graph was densified, and \citeA{Mosaffa2026} found improvements from a GNN that routes LSTM outputs between sub-basins, mostly at large downstream stations.
+
+The second family embeds physically based routing, such as Muskingum--Cunge \cite{Cunge1969,David2011} or travel-time kernels \cite{Lohmann1996,Mizukami2016}, and makes it trainable together with neural networks \cite{Shen2023}. \citeA{Bindas2024} learned channel roughness within a differentiable Muskingum--Cunge model and improved simulations in large basins, including at gauges not used in training, and \citeA{Song2025} extended the approach to the conterminous United States. The two families have developed largely separately: no study compares learned message passing with physical routing. Physical structure does not always help, since a mass-conserving LSTM was less accurate than an unconstrained one for extreme events \cite{Frame2022,Hoedt2021}.
+
+\subsection{Using Streamflow Observations in Forecasts}
+\label{sec:obs}
+
+Recent streamflow observations are the most informative input to a short-range forecast. In lumped deep-learning models, they enter through autoregression or data assimilation, which improve skill at the gauge where the observation is made \cite{Feng2020,Nearing2022} but not at an ungauged location. Process-based systems carry the information further: the NWM nudges its simulated flow toward observations before each forecast, and routing moves the correction to the reaches downstream \cite{Cosgrove2024}. The value of an upstream observation should depend on how much of the downstream flow passes the gauge and on the travel time between them. Learned network models have used observations from other gauges as inputs to message passing \cite{Kirschstein2024,WangH2025} or propagated residuals along the graph \cite{Sun2022}. In these designs the contribution of the observations cannot be separated from that of the graph, and their value at an ungauged reach below a gauge has not been quantified.
+
+\subsection{Evaluating Forecasts at Unmonitored Locations}
+\label{sec:attribution}
+
+Three aspects of evaluation determine whether conclusions transfer to practice. First, forecasts should be driven by weather predictions rather than observed meteorology, because precipitation forecast error dominates at medium range \cite{Cloke2009,Wood2008}; few machine-learning studies meet this condition \cite{Nevo2022,Hunt2022,Nearing2024}. Second, randomly withheld gauges often have gauged neighbors on the same river, so spatially blocked hold-outs are a stricter test \cite{Roberts2017,Feng2021}. Third, a single efficiency score can hide systematic errors: the Nash--Sutcliffe efficiency \cite{Nash1970} can reward forecasts that underestimate variability, which the Kling--Gupta decomposition reveals \cite{Gupta2009}.
+
+Table~\ref{tab:related} summarizes what each line of work has established and what it leaves open; each open point corresponds to one of the research questions in Section~\ref{sec:intro}. No study has compared learned message passing, physical routing, and upstream observations within one model, at spatially withheld gauges, under operational precipitation forecasts. This gap motivates the present study.
+
+
+\begin{table}
+\caption{Prior Work on Network-Aware Streamflow Prediction and the Questions It Leaves Open}
+\label{tab:related}
+\footnotesize
+\setlength{\parindent}{0pt}
+\renewcommand{\arraystretch}{1.3}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.14\textwidth} >{\raggedright\arraybackslash}p{0.19\textwidth} >{\raggedright\arraybackslash}p{0.25\textwidth} >{\raggedright\arraybackslash}p{0.27\textwidth} >{\raggedright\arraybackslash}p{0.05\textwidth}@{}}
+\toprule
+\textbf{Approach} & \textbf{Studies} & \textbf{What is known} & \textbf{What remains open} & \textbf{RQ} \\
+\midrule
+Lumped regional LSTM &
+\cite{Kratzert2019wrr,Nearing2024} &
+Accurate prediction in ungauged basins, including under weather forecasts &
+The river network is not represented, and upstream gauges cannot be used &
+RQ1 \\
+\addlinespace
+Learned message passing (GNN) &
+\cite{Jia2021,Sun2022,Kirschstein2024,WangH2025,Mosaffa2026} &
+The network can be encoded as a graph, but the benefit of its topology is disputed &
+Scored at gauges seen in training with observed weather; not compared with physical routing &
+RQ1, RQ2 \\
+\addlinespace
+Differentiable physical routing &
+\cite{Bindas2024,Song2025} &
+Learned routing parameters improve simulated flow in large basins &
+Simulation with observed forcing; no comparison with learned message passing, and no spatially blocked test &
+RQ2 \\
+\addlinespace
+Upstream gauge observations &
+\cite{Feng2020,Nearing2022,Cosgrove2024} &
+Observations raise skill at the gauge; process-based systems carry them downstream &
+Their value at ungauged reaches below a gauge has not been measured for learned forecasts &
+RQ3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+% VERIFY Table 1 against the full texts, especially the "What remains open"
+% entries for the graph studies (scoring at training gauges only, observed
+% forcing) and Song et al. (2025).
+
+
+%=====================================================================
+% SECTION 3: STUDY AREA, DATA, AND FORECAST PROTOCOL
+% Public data products only. Numbers come from reports/section3_facts.md
+% (21 Nov 2026). Detail moved to the Supporting Information (Tables S1-S2,
+% Figures S1-S2).
+%=====================================================================
+\section{Study Area, Data, and Forecast Protocol}
+\label{sec:data}
+
+\subsection{Study Area and River Network}
+\label{sec:study}
+We study the Tennessee River Basin (HUC 06), which drains about 106,000~km$^2$ of the southeastern United States (Figure~\ref{fig:area}a). Mean catchment elevation rises from about 190~m in the western lowlands (west of 87$^\circ$W) to about 700~m in the east (east of 84$^\circ$W), and reaches more than 1,500~m in the highest catchments of the Appalachian highlands. Mean annual precipitation, from the Analysis of Record for Calibration (AORC) \cite{Fall2023}, is about 1,420~mm (2000--2019). It differs little between the western and eastern parts of the basin (about 1,440 and 1,360~mm), and only the highest catchments are clearly wetter (about 1,590~mm).
+% facts sheet section 15 (precipitation by region and elevation class); section 14 (AORC units assumed as mm per six-hour step).
+
+We represent the river network by the flowlines of NHDPlus Version 2.1 \cite{McKay2012}. The network has 58,834 reaches connected by 60,267 directed links, with Strahler stream orders from 1 to 8. Most reaches are small: 45,703 (77.7\%) drain less than 50~km$^2$, and 1,569 drain more than 5,000~km$^2$. Every reach is a forecast location.
+
+\begin{figure}
+\figfile{figures/fig1_study_area.pdf}{\textwidth}
+\caption{Study area. (a) River network of the Tennessee River Basin (NHDPlus Version 2.1; 58,834 reaches, major rivers drawn) and the 101 evaluation gauges. (b) The three basins withheld in the blocked protocol, B1--B3, with the gauges evaluated in each; the other evaluation gauges are shown in gray.}
+\label{fig:area}
+\end{figure}
+
+\subsection{Streamflow Observations and Evaluation Gauges}
+\label{sec:gauges}
+Observed discharge comes from the hourly streamflow of the CAMELSH data set \cite{Tran2025} until 2019-10-31, and from instantaneous discharge of the USGS National Water Information System (NWIS), averaged to the hour, from 2019-11-01. Hourly values are averaged to six-hour means in UTC when all six hours are present. Negative values are treated as missing, and gaps are not filled.
+
+We matched 128 USGS gauges to reaches of the network: each gauge was assigned the nearest reach within 1,500~m whose drainage area is between 0.8 and 1.25 times the gauge's reported area. Of these gauges, 125 are CAMELSH sites and 3 have NWIS records only. We evaluate forecasts at the CAMELSH gauges that have at least 100 forecast--observation pairs at 24~h lead in the test period, a positive mean flow, and a standard deviation of at least $10^{-3}$~m$^3$\,s$^{-1}$. This gives 101 evaluation gauges. Of the other 27 gauges, 24 have records that end before the test period, and 3 have no CAMELSH record.
+
+The evaluation gauges are not a representative sample of the network (Figure~\ref{fig:gauges}a). Their median drainage area is 382~km$^2$, against 5.8~km$^2$ for all reaches, and only 4.0\% of them drain less than 50~km$^2$, against 77.7\% of the reaches. Skill at gauges therefore describes medium and large rivers, and we use the reach-level evaluation of Section~\ref{sec:holdout} for small streams.
+
+Because RQ3 concerns observations made upstream of a forecast location, we distinguish two kinds of evaluation gauge by their position in the network (Figure~\ref{fig:gauges}b). A gauge is \emph{nested} if at least one of the 128 matched gauges lies in its upstream basin, and a \emph{headwater gauge} otherwise. Of the 101 evaluation gauges, 44 are nested and 57 are headwater gauges, with median drainage areas of 1,238 and 275~km$^2$. Nested gauges drain larger basins, so we compare results by position only at similar drainage areas.
+% facts sheet section 15. If only the 101 evaluation gauges count as upstream gauges, the split is 39 nested (median 1,659 km^2) and 62 (median 276 km^2).
+
+Record length varies among gauges (Figure~S1). Three evaluation gauges have no training-period data because their records begin in 2019 or later, and in the test period 89 of the 101 are observed at least 95\% of the time.
+
+\begin{figure}
+\figfile{figures/fig3_representativeness.pdf}{\textwidth}
+\caption{Evaluation gauges. (a) Cumulative distribution of drainage area for all reaches ($n = 58{,}834$), all matched gauges ($n = 128$, dashed), and evaluation gauges ($n = 101$); dots mark the medians. (b) Drainage area of headwater ($n = 57$) and nested ($n = 44$) evaluation gauges; bars mark the medians.}
+\label{fig:gauges}
+\end{figure}
+
+\subsection{Meteorological Forcing and Catchment Attributes}
+\label{sec:inputs}
+Weather before the forecast issue time comes from AORC version 1.1 \cite{Fall2023}: precipitation, 2~m air temperature and specific humidity, surface pressure, downward shortwave and longwave radiation, and the two components of the 10~m wind. The hourly fields on the 1/120$^\circ$ grid are aggregated to six-hour values and averaged over the local catchment of each reach, weighted by area. The 1,192 reaches without a catchment polygon in NHDPlus receive no local forcing.
+
+Precipitation after the issue time comes from the control member of the Global Ensemble Forecast System, version 12 (GEFSv12) \cite{Zhou2022,Guan2022}, as six-hour totals from the 00Z cycle at leads to 240~h. Each AORC cell takes the value of the nearest forecast grid point, and the values are averaged over catchments with the same weights. Training and validation use the GEFSv12 reforecast \cite{Guan2022}, and testing uses the archived operational forecasts. No other variable is forecast, so future temperature, humidity, radiation, and wind are unknown to all models.
+
+Each reach has 24 static attributes from NHDPlus and EPA StreamCat \cite{Hill2016}: reach geometry, elevation, stream order, drainage area, and seven soil and subsurface properties. We also derive seven antecedent-wetness indices from AORC, which are exponentially weighted means of precipitation and air temperature at several time scales (Table~S3). Table~S1 lists all data products and their periods.
+
+\subsection{Forecast Setup and Temporal Partitions}
+\label{sec:protocol}
+A forecast is issued every day at 00Z and gives six-hour mean discharge at every reach for 40 lead times, from 6 to 240~h. At the issue time, a model has the observed weather of the previous 36 days at every reach, forecast precipitation for the next 10 days, and the discharge observed up to the issue time at gauges that are not withheld (Figure~S2). A gauge is \emph{visible} at an issue time if it is not withheld by the evaluation protocol and reported at least 8 of the last 32 six-hour values. We assume that observations are available without delay; in real time, NWIS data arrive with a lag, so this assumption favors the use of upstream observations.
+
+The data are split in time. Training uses the 6,931 reforecast issue days from 2000-01-01 to 2018-12-22, so that all training targets precede 2019. Validation uses the 355 issue days of 2019 (2019-01-01 to 2019-12-21) and serves only for model selection. The test period contains the 1,917 issue days from 2020-09-23, the start of the operational archive, to 2025-12-22 on which both GEFSv12 and NWM forecasts are available. The months between validation and test are not used. We summarize skill over the leads of 24, 48, 72, 96, and 120~h (days 1--5).
+
+\subsection{Spatial Evaluation Protocols}
+\label{sec:holdout}
+Forecasts at unmonitored reaches cannot be verified directly, so we evaluate them at gauges whose observations are withheld from the model. Three protocols withhold progressively more information, and a fourth evaluation covers every reach.
+
+\textit{Gauged.} Models are trained with the 122 gauges that have at least 1,460 six-hour values before 2019 and are evaluated at the 101 evaluation gauges. This conventional setting serves as an upper reference. The three gauges without training-period records are effectively unseen even here.
+
+\textit{Random hold-out.} The 122 gauges are divided into five folds of 24 or 25 gauges. The gauges are sorted by drainage area, and each consecutive group of five is assigned a random permutation of the fold numbers, so that every fold contains small and large basins. For each fold, a separate model is trained and selected without the observations of that fold's gauges and is evaluated at them. This covers 98 of the 101 evaluation gauges; the three gauges without training-period records belong to no fold. A withheld gauge usually has gauged neighbors upstream, downstream, or on adjacent tributaries.
+
+\textit{Blocked basins.} To remove nearby gauged information, we withhold entire upstream basins. Starting with the gauges whose basins contain the most gauges with training-period records, we select up to three non-overlapping basins that each contain 8 to 30 such gauges and no more than 25\% of the network area. The rule uses only network topology and gauge counts. It selects the basins of the French Broad River near Newport, Tennessee (B1; USGS 03455000), the Holston River near Knoxville, Tennessee (B2; 03495500), and the Hiwassee River at Charleston, Tennessee (B3; 03566000) (Figure~\ref{fig:area}b). They contain 15, 13, and 12 such gauges and cover 4.6, 9.1, and 5.7\% of the network area. For each basin, a model is trained and selected without the gauges inside it and is evaluated at the 12, 11, and 6 of them that are evaluation gauges, 29 in total. Gauges downstream of a withheld basin remain in training.
+
+The three basins lie in the eastern highlands, and their gauged catchments are higher (691 to 940~m against 623~m) and more forested (66 to 81\% against 64\%) than the other evaluation gauges (Table~S2). The blocked protocol therefore tests transfer to unseen terrain as well as to unseen basins, and with three basins its results are informative but uncertain.
+
+In all protocols, a withheld gauge contributes no observations at any time, neither as a training target, nor as an input, nor for model selection. Tests of the data pipeline and of the trained models confirm this (Text~S1).
+
+\textit{Every reach.} Gauges cover few small streams, so we also evaluate forecasts at every reach against the NWM v3.0 retrospective simulation, for every second test issue up to 2023-01-20 (425 issues). Reaches inside the upstream basin of a randomly withheld gauge (31,684 reaches) are evaluated with the model of that gauge's fold, and the other 27,150 reaches with the model trained with all gauges. Because the reference is itself a model, this evaluation measures agreement with the NWM simulation rather than accuracy against observations, and it is used to examine how skill changes with drainage area.
+
+
+%=====================================================================
+% SECTION 4: MODELS AND EXPERIMENTS
+% Numbers come from reports/section4_facts.md (21 Nov 2026). Detail moved to
+% the Supporting Information (Texts S3-S6, Tables S3-S5).
+%=====================================================================
+\section{Models and Experiments}
+\label{sec:methods}
+
+All reach-scale models in this study belong to one family. They share the inputs, the encoder, the output quantity, and the training procedure, and differ only in which of three network mechanisms they contain: learned message passing between neighboring reaches, Manning-type channel routing, and insertion of upstream gauge observations. We describe the full model (Section~\ref{sec:framework}), the three mechanisms (Section~\ref{sec:mechanisms}), and the variants that remove them (Section~\ref{sec:ablations}), then the baselines (Section~\ref{sec:baselines}), training (Section~\ref{sec:training}), and metrics (Section~\ref{sec:metrics}).
+
+\subsection{Reach-Scale Forecasting Framework}
+\label{sec:framework}
+
+The model produces discharge at all 58,834 reaches for the 40 lead times of one issue (Figure~\ref{fig:model}). Each reach has a series of 184 six-hour steps, 144 before the issue time and 40 after it, with the eight weather variables, the season, and flags for validity. After the issue time, the only weather input is the GEFSv12 precipitation forecast. At visible gauges the model also reads observed discharge, at the gauge's own reach and, as specific discharge, at every reach in the gauge's basin. Each reach also has 24 static attributes, seven antecedent indices, and an area ratio to the gauge basin that contains it (Table~S3).
+
+A single LSTM layer \cite{Hochreiter1997} with 128 hidden units, shared by all reaches, encodes each series into a state $h_j(t)$ of 32 channels. A linear head converts the state of reach $j$ to a runoff depth, which is multiplied by the local catchment area $a_j$ to give the lateral inflow
+\begin{linenomath*}
+\begin{equation}
+q_j(t) = \frac{a_j}{21.6}\,\cdot\,0.5\,\mathrm{softplus}\!\left(w^{\top}h_j(t) + b\right),
+\label{eq:inflow}
+\end{equation}
+\end{linenomath*}
+in m$^3$\,s$^{-1}$, where $a_j$ is in km$^2$ and 21.6 converts millimeters per six hours over one square kilometer to cubic meters per second. Area scaling is therefore part of the model, and not a rescaling of a predicted specific discharge.
+
+Lateral inflow is moved downstream by a convolution over the network,
+\begin{linenomath*}
+\begin{equation}
+Q_i(t) = \sum_{j \in \mathcal{U}(i)} f_{ij} \sum_{s=0}^{47} h_{ij}(s)\, q_j(t-s),
+\label{eq:route}
+\end{equation}
+\end{linenomath*}
+where $\mathcal{U}(i)$ are the reaches upstream of $i$ including $i$ itself, $f_{ij}$ is the fraction of the water of reach $j$ that reaches $i$ (one except below divergences, where the flow splits between branches), and $h_{ij}$ is a kernel over 48 six-hour steps that sums to one and sets the travel time and attenuation between the two reaches. Mass is therefore conserved. Only the last 72 routed steps are used (32 before the issue time and the 40 leads), because the first 47 have incomplete memory.
+
+At each visible gauge, a second LSTM encoder--decoder reads the gauge's recent observations and the routed flow and gives a multiplicative correction to the routed flow over the 40 leads. This gauge head is the model's forecast at a visible gauge; at a withheld gauge, the forecast is the routed flow (Text~S3).
+
+\begin{figure}
+\figfile{figures/fig4_model.pdf}{\textwidth}
+\caption{The reach-scale model. (a) At every reach, observed weather, forecast precipitation, static attributes, and the history of visible gauges are encoded by an LSTM; three graph layers exchange information between reaches connected by NHDPlus links; and a linear head converts the result to lateral inflow. (b) Lateral inflow is routed downstream with Manning-type travel times. At a visible gauge, a correction is routed downstream in the same way and added to the flow at every reach below it, including reaches where no observation exists.}
+\label{fig:model}
+\end{figure}
+
+\subsection{The Three Network Mechanisms}
+\label{sec:mechanisms}
+
+\textit{Learned message passing.} Three graph layers act on the encoder states. Each layer is a residual block that concatenates the normalized state of a reach with the mean state of its upstream neighbors and the mean state of its downstream neighbors, and adds the output of a small network applied to that concatenation,
+\begin{linenomath*}
+\begin{equation}
+h_i \leftarrow h_i + \mathrm{MLP}\!\left(\left[\,\mathrm{LayerNorm}(h_i),\ \overline{h}_{\mathrm{up}(i)},\ \overline{h}_{\mathrm{down}(i)}\,\right]\right).
+\label{eq:graph}
+\end{equation}
+\end{linenomath*}
+Messages travel in both directions along the 60,267 links, so after three layers a reach has seen states up to three links upstream and downstream. The layers act before the runoff head, so message passing changes how much water each reach produces, not how water is transported.
+
+\textit{Manning-type routing.} The kernels of Equation~\ref{eq:route} are built from channel physics. For reach $r$ with slope $S_r$, length $L_r$, and reference discharge $\bar{Q}_r$, the depth, velocity, and wave celerity are
+\begin{linenomath*}
+\begin{equation}
+d_r = p_r\left(\bar{Q}_r + 0.01\right)^{0.4},
+\qquad
+v_r = \frac{d_r^{2/3}\,S_r^{1/2}}{n_r},
+\qquad
+c_r = \tfrac{5}{3}\,v_r,
+\label{eq:manning}
+\end{equation}
+\end{linenomath*}
+where $v_r$ follows Manning's equation \cite{Chow1959} and the celerity of a kinematic wave in a wide channel is five thirds of the mean velocity \cite{Lighthill1955}. The travel time of a reach is $t_r = L_r / c_r$, and the travel time between two reaches is the sum along the channel between them. The reference discharge is the time mean of the lateral inflow accumulated over the upstream area, so travel times are shorter at high flow. Manning's roughness $n_r$, the depth coefficient $p_r$, and, for lakes and reservoirs, a wave speed are predicted at every reach by a small network from the reach's attributes and trained with the rest of the model. Each travel time is turned into a kernel by interpolating between 14 delay classes whose widths are also learned (Text~S4).
+
+\textit{Gauge insertion.} Insertion carries the information in an upstream observation to the reaches below it. At each visible gauge $g$, the model forms a correction $\Delta_g(t)$. For the 80 steps before the issue time, it is the observed minus the routed discharge at the gauge, and zero where the observation is missing. For the 40 leads, it is the gauge head's forecast minus the routed discharge. The correction is routed downstream with the same shares and kernels as the water and added to the flow at every reach below the gauge,
+\begin{linenomath*}
+\begin{equation}
+Q'_i(t) = \max\!\left(0,\ \hat{Q}_i(t) + \sum_{g \in \mathcal{V},\, g \neq i} f_{gi} \sum_{s} h_{gi}(s)\, \Delta_g(t-s)\right),
+\label{eq:insert}
+\end{equation}
+\end{linenomath*}
+where $\hat{Q}_i$ is the routed flow before insertion and $\mathcal{V}$ is the set of visible gauges. The correction has full weight, no observation after the issue time is used, and a gauge is never corrected by its own series. Insertion is also active during training (Text~S4).
+
+\subsection{Model Variants}
+\label{sec:ablations}
+
+Four variants isolate the three mechanisms (Table~\ref{tab:models}). M0 contains all three. M1 removes insertion. M2 removes the graph layers. M4 replaces the Manning kernels with kernels that put all their weight on the first step, so that water from every upstream reach arrives within the same six hours; M4 keeps the accumulation of flow along the network and removes travel time and attenuation. Each comparison answers one question: M0 against the LSTM asks whether the network helps at all (RQ1), M0 against M2 isolates message passing and M1 against M4 isolates routing (RQ2), and M0 against M1 isolates insertion (RQ3). Within each pair, all other choices are held fixed.
+
+\begin{table}
+\caption{Model Variants and the Mechanisms They Contain}
+\label{tab:models}
+\footnotesize
+\setlength{\parindent}{0pt}
+\renewcommand{\arraystretch}{1.3}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}l l l l r >{\raggedright\arraybackslash}p{0.26\textwidth}@{}}
+\toprule
+\textbf{Model} & \textbf{Message passing} & \textbf{Routing} & \textbf{Insertion} & \textbf{Parameters} & \textbf{Contrast} \\
+\midrule
+M0 & 3 graph layers & Manning & Yes & 932,347 & Full model \\
+M1 & 3 graph layers & Manning & No & 932,347 & M0 $-$ M1: insertion (RQ3) \\
+M2 & None & Manning & Yes & 919,675 & M0 $-$ M2: message passing (RQ2) \\
+M4 & 3 graph layers & Instantaneous & No & 928,654 & M1 $-$ M4: routing (RQ2) \\
+\addlinespace
+LSTM & \multicolumn{3}{l}{Lumped} & 810,369 & M0 $-$ LSTM: the network (RQ1) \\
+NWM & \multicolumn{3}{l}{Process-based operational forecast} & --- & Reference \\
+\bottomrule
+\end{tabular}
+\begin{flushleft}
+\footnotesize \emph{Note.} Manning routing is the Manning-type routing of Equation~\ref{eq:manning}. All four variants share the inputs, the encoder, the area scaling, the NWM pretraining, the gauge head, and the training schedule of Section~\ref{sec:training}. Parameters are trainable parameters of the trained checkpoints. Instantaneous routing accumulates flow along the network without travel time or attenuation.
+\end{flushleft}
+\end{table}
+
+The ablations separate the three mechanisms, but they do not isolate all use of streamflow observations. Observations of visible gauges reach every variant through three further routes: the reach's own gauge history, the specific discharge of the containing gauge broadcast to every reach in its basin, and the gauge head. The M0$-$M1 difference therefore measures the additional value of routing a correction downstream, not the total value of upstream observations. Insertion can act only where a visible gauge lies upstream of the forecast location: at 44 of the 101 evaluation gauges in the gauged protocol, 40 of 98 in the random hold-out, and none of the 29 in the blocked protocol, where the whole upstream basin is withheld.
+
+\subsection{The LSTM Baseline and the NWM Reference}
+\label{sec:baselines}
+
+\textit{LSTM baseline.} The baseline is a regional encoder--decoder LSTM trained on all gauges at once, as is standard for ungauged prediction \cite{Kratzert2019wrr}. For each gauge it reads 30 days of basin-mean weather and the gauge's own discharge, the basin-mean static attributes and antecedent indices, and the basin-mean forecast precipitation at the 40 leads. It predicts log specific discharge, which is multiplied by drainage area, so it is scaled by area in the same way as the reach-scale models. It is not matched to them input for input: it receives no observations from other gauges, no NWM pretraining or prior term, and no seasonal input, it sees basin means over 30 days and not per-reach series over 36 days, and it is trained with different lead weights and a larger number of smaller updates. The M0$-$LSTM difference is therefore a difference between two systems, of which the river network is the main but not the only part (Section~6).
+% NOTE Section 6: the LSTM is not input-matched (no other gauges, no NWM pretraining or prior,
+% no season, basin-mean 30-day inputs, different lead weighting and training volume). The
+% selected LSTM checkpoints are early in training (13,754 of 68,767 updates for the gauged model).
+
+\textit{NWM reference.} The NWM enters in two roles. Its version 3.0 retrospective simulation \cite{Cosgrove2024} is the pretraining target and the reference for the reach-level evaluation. The archived operational medium-range forecast (deterministic member, 00Z cycle, flow every 3~h to 240~h) is the reference at gauges, and we form six-hour means from its 3-hourly values by trapezoidal integration. The operational model changed from version 2.0 to 2.1 on 2021-04-20 and to 3.0 on 2023-09-20. It also nudges simulated flow toward observations at gauges, including gauges that our models treat as withheld, so it is a reference for operational skill and not a competitor under matched information. Issues at which the NWM forecast is missing are dropped for all models. Because the NWM is calibrated to streamflow at gauges, its retrospective simulation may also carry information about withheld gauges; this can affect only the reach-scale models (Section~6).
+% VERIFY: whether the NWM v3.0 retrospective was calibrated at any of the withheld gauges
+% cannot be determined from the repository (section4_facts.md, 11.4 item 2). Check the NWM v3.0
+% calibration gauge list against the 128 matched gauges and state the result here.
+
+\subsection{Training}
+\label{sec:training}
+
+Training has two stages. Stage A fits the model to the NWM v3.0 retrospective at every reach, without gauge observations (5,000 updates), which gives the encoder, the runoff head, and the router a target at the small streams where no gauge exists. Stage B fits observed discharge (3,000 updates), starting from the stage-A weights with all parameters free. One stage-A model per variant is shared by all folds and protocols, because it uses no gauge data.
+
+In stage B, each gauge that is not withheld is visible with probability one half (and none is visible in 15\% of samples), so the model learns both to use and to do without upstream observations. The loss combines the squared forecast error at the training gauges, scaled by each gauge's standard deviation; a pinball loss on high-flow quantiles; and, at weight 0.3, the stage-A loss, which keeps the model anchored at ungauged reaches (Text~S5). Withheld gauges are excluded from the loss, from model selection, and from every input. We select the checkpoint on the 2019 validation issues by the median NSE at training gauges over leads of 24 to 120~h. One model is trained for each protocol (one with all gauges, five for the random folds, three for the blocked basins), each once with a single random seed, so the comparisons carry no estimate of run-to-run variability.
+% VERIFY on 21 Nov 2026: M4 had no gauged run and its three blocked-basin runs were unfinished.
+% Adjust this paragraph and Table 2 if M4 is reported for the random hold-out only.
+
+\subsection{Metrics}
+\label{sec:metrics}
+
+At each gauge and lead, we pool all test issues at which the observation, the observation at the issue time, and the NWM forecast are present, and compute the Nash--Sutcliffe efficiency (NSE) \cite{Nash1970} and the Kling--Gupta efficiency (KGE) with its three components \cite{Gupta2009}. Results are the median over gauges at each lead, and the days 1 to 5 summary is the mean of the medians at 24, 48, 72, 96, and 120~h. Every comparison uses the gauges scored by all models in it (101 in the gauged protocol, 98 in the random hold-out, and 29 in the blocked protocol), and differences are paired by gauge. Uncertainty comes from a bootstrap over gauges \cite{Efron1993}. We test differences with the Wilcoxon signed-rank test \cite{Wilcoxon1945} and practical equivalence with two one-sided tests \cite{Schuirmann1987} at margins of 0.01 and 0.02 NSE, with Holm correction within each protocol \cite{Holm1979} (Text~S6). Because each model was trained once, the intervals describe variability across gauges, not across training runs.
+
+%=====================================================================
+% SECTIONS STILL TO BE WRITTEN
+%=====================================================================
+%\section{Results}
+%\subsection{Reach-Scale Model Versus the LSTM (H1)}
+%\subsection{Message Passing Versus Routing (H2)}
+%\subsection{The Value of Upstream Observations (H3)}
+%\subsection{Behavior at Every Reach}
+%\section{Discussion}
+%\section{Conclusions}
+
+%  Numbered lines in equations:
+%  To add line numbers to lines in equations,
+%  \begin{linenomath*}
+%  \begin{equation}
+%  \end{equation}
+%  \end{linenomath*}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% DATA SECTION and ACKNOWLEDGMENTS
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section*{Open Research Section}
+[ To be completed: data and software availability statements. ]
+
+\section*{Conflict of Interest disclosure}
+[ To be completed. ]
+
+\acknowledgments
+[ To be completed. ]
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REFERENCES and BIBLIOGRAPHY
+%
+% Please use ONLY \cite and \citeA for reference citations.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\bibliography{references}
+
+\end{document}

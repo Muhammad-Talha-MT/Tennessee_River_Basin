@@ -1,0 +1,30 @@
+\begin{table}
+\centering
+\caption{Median NSE and KGE over the full forecast horizon (6--240~h, 1--10~days)}
+\label{tab:skill}
+\footnotesize
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccc@{}}
+\toprule
+ & \multicolumn{2}{c}{Gauged ($n = 101$)} & \multicolumn{2}{c}{Random hold-out ($n = 98$)} & \multicolumn{2}{c}{Blocked basins ($n = 29$)} \\
+\cmidrule{2-3}\cmidrule{4-5}\cmidrule{6-7}
+Model & NSE & KGE & NSE & KGE & NSE & KGE \\
+\midrule
+\multicolumn{7}{l}{\emph{Reach-scale models}} \\
+GNN & \textbf{0.354} & 0.428 & 0.303 & 0.342 & 0.231 & 0.246 \\
+GNN-noIns & 0.352 & \textbf{0.429} & \textbf{0.304} & 0.340 & 0.228 & 0.256 \\
+GNN-noMP & 0.346 & 0.417 & 0.303 & \textbf{0.347} & \textbf{0.236} & 0.230 \\
+GNN-Instat & --- & --- & 0.294 & 0.338 & 0.231 & 0.233 \\
+\midrule
+\multicolumn{7}{l}{\emph{Baseline (different system)}} \\
+LSTM & 0.340 & 0.386 & 0.281 & 0.319 & 0.200 & \textbf{0.300} \\
+GNN $-$ LSTM & +0.014 & +0.041 & +0.022 & +0.023 & +0.031 & $-$0.054 \\
+\midrule
+\multicolumn{7}{l}{\emph{Reference (not a competitor)}} \\
+NWM & 0.057 & 0.379 & 0.058 & 0.384 & 0.069 & 0.301 \\
+\bottomrule
+\end{tabular*}
+\begin{flushleft}
+\footnotesize \emph{Note.} Median over the $n$ gauges at each lead, averaged over the 40 leads of 6 to 240~h. Bold: highest value among the trained models (reach-scale models and LSTM) in each column. GNN $-$ LSTM is the difference of the two rows above it, not the paired difference of Section~\ref{sec:res-lstm}. Differences smaller than 0.02 lie within the equivalence margin (Table~S6). GNN-Instat was not trained for the gauged protocol. The LSTM is trained in the same folds as the reach-scale models but is not matched to them in inputs (Section~\ref{sec:baselines}). The NWM forecast is nudged toward observations, including at gauges that the other models withhold, and is shown as a reference of operational skill only.
+\end{flushleft}
+\end{table}

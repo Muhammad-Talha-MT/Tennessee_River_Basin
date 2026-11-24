@@ -1,0 +1,3 @@
+check,value,spread
+max relative error of the router against the share-weighted sum of upstream inflow,2.4375269290417546e-06,
+"flow leaving the 36 outlets / lateral inflow of the whole network, 8 random steps",0.9999999403953552,1.128897338276147e-06

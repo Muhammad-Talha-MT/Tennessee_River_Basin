@@ -1,0 +1,42 @@
+\begin{table}
+\caption{Paired Differences in Days 1--5 NSE}
+\label{tab:contrasts}
+\footnotesize
+\setlength{\parindent}{0pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+Protocol & Contrast & $n$ & Difference & 5--95\% interval & Holm $p$ \\
+\midrule
+Gauged & GNN $-$ LSTM & 101 & +0.020 & [+0.007, +0.035] & 0.053 \\
+ & GNN $-$ NWM & 101 & +0.303 & [+0.226, +0.398] & $<$0.001 \\
+ & GNN $-$ GNN-noMP & 101 & +0.005 & [+0.002, +0.009] & 0.051 \\
+ & GNN-noIns $-$ GNN-Instat & --- & \multicolumn{3}{c}{GNN-Instat not trained} \\
+ & GNN $-$ GNN-noIns & 101 & +0.002 & [+0.001, +0.004] & 0.003 \\
+ & GNN-noIns $-$ LSTM & 101 & +0.017 & [+0.004, +0.032] & 0.082 \\
+ & GNN-noMP $-$ LSTM & 101 & +0.015 & [+0.002, +0.028] & 0.083 \\
+ & GNN-Instat $-$ LSTM & --- & \multicolumn{3}{c}{GNN-Instat not trained} \\
+\addlinespace
+Random hold-out & GNN $-$ LSTM & 98 & +0.015 & [-0.010, +0.037] & 0.012 \\
+ & GNN $-$ NWM & 98 & +0.207 & [+0.125, +0.298] & $<$0.001 \\
+ & GNN $-$ GNN-noMP & 98 & +0.023 & [-0.002, +0.054] & 0.986 \\
+ & GNN-noIns $-$ GNN-Instat & 98 & +0.033 & [+0.016, +0.053] & $<$0.001 \\
+ & GNN $-$ GNN-noIns & 98 & +0.000 & [-0.007, +0.007] & 0.986 \\
+ & GNN-noIns $-$ LSTM & 98 & +0.015 & [-0.014, +0.040] & 0.012 \\
+ & GNN-noMP $-$ LSTM & 98 & -0.009 & [-0.052, +0.027] & 0.015 \\
+ & GNN-Instat $-$ LSTM & 98 & -0.018 & [-0.059, +0.016] & 0.274 \\
+\addlinespace
+Blocked basins & GNN $-$ LSTM & 29 & +0.066 & [+0.026, +0.105] & 0.089 \\
+ & GNN $-$ NWM & 29 & +0.390 & [+0.186, +0.643] & $<$0.001 \\
+ & GNN $-$ GNN-noMP & 29 & -0.013 & [-0.038, +0.010] & 1.000 \\
+ & GNN-noIns $-$ GNN-Instat & 29 & -0.006 & [-0.037, +0.021] & 1.000 \\
+ & GNN $-$ GNN-noIns & 29 & +0.012 & [+0.002, +0.026] & 1.000 \\
+ & GNN-noIns $-$ LSTM & 29 & +0.053 & [+0.015, +0.090] & 0.146 \\
+ & GNN-noMP $-$ LSTM & 29 & +0.079 & [+0.042, +0.116] & 0.010 \\
+ & GNN-Instat $-$ LSTM & 29 & +0.059 & [+0.020, +0.100] & 0.083 \\
+\bottomrule
+\end{tabular}
+\begin{flushleft}
+\footnotesize \emph{Note.} Difference = first minus second model, mean over the $n$ gauges both score of the per-gauge mean NSE over leads 24--120~h. Interval: gauge bootstrap (10,000 resamples). Holm $p$: Wilcoxon signed-rank test, Holm-corrected across the contrasts of each protocol.
+\end{flushleft}
+\end{table}

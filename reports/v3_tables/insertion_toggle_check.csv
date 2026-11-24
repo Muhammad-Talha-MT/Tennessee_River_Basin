@@ -1,0 +1,7 @@
+issue_step,subset,gauges,max_abs_change_m3s,median_abs_change_m3s,max_flow_m3s
+64840,visible gauges,82,0.0,0.0,110.5438461303711
+64840,"hidden, no visible gauge upstream",32,0.0,0.0,19.074207305908203
+64840,"hidden, visible gauge upstream",14,13.969746589660645,1.1210064888000488,112.4077377319336
+66840,visible gauges,73,0.0,0.0,82.02200317382812
+66840,"hidden, no visible gauge upstream",35,0.0,0.0,5.974414825439453
+66840,"hidden, visible gauge upstream",20,7.584484100341797,0.4553403854370117,73.21742248535156

@@ -1,0 +1,10 @@
+M4 against M1, stage B, blocked fold 1 (settings that differ):
+  --init: ['/data/tva_data/models/attr/manning_A/best.pt'] -> ['/data/tva_data/models/attr/instant_A/best.pt']
+  --out: ['/data/tva_data/models/attr/S1_M1_s1_b1'] -> ['/data/tva_data/models/attr/S1_M4_s1_b1']
+  --router: ['manning'] -> ['instant']
+
+Settings identical: --accumulate, --delta-weight, --fold, --head, --loss, --lr, --resume, --scheme, --seed, --select, --stage, --updates, --validate-every, --warmup, --workers
+
+M4 stage A (instant_A) arguments: --seed 1 --accumulate 4 --stage A --router instant --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000 --resume  --workers 5 --graph-layers 3
+M1 stage A (manning_A) arguments:  --stage A --router manning --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000 --resume --graph-layers 3 (from the pipeline's MANNING_A)
+Both: 5,000 updates of 8 samples, same learning-rate schedule, 3 graph layers; only the router differs.

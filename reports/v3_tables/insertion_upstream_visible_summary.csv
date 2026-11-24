@@ -1,0 +1,4 @@
+protocol,scored_gauges,with_upstream_gauge,with_upstream_visible_gauge,mean_share_issues_with_visible_upstream,with_visible_upstream_in_over_half_of_issues,median_covered_area_share_when_present
+gauged,101,44,44,0.39170114194518046,40,0.544151782989502
+heldout,98,44,40,0.372488901663952,37,0.5123694539070129
+blocked,29,11,0,0.0,0,

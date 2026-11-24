@@ -1,0 +1,193 @@
+%=====================================================================
+% SECTION 5: RESULTS AND DISCUSSION  (skeleton; not part of paper.tex)
+% Structure and paragraph plan: reports/section5_structure.md
+% Numbers: reports/section5_facts.md and reports/section5/*.csv
+%   (scripts/section5/s5_facts.py). Every % comment below is a paragraph
+%   to write; numbers in comments are copied from the facts sheet.
+% Figure numbers assume paper Figures 1-3 = area, gauges, model.
+% If Figure 6 moves to the SI, Figures 7-10 become 6-9.
+%=====================================================================
+\section{Results and Discussion}
+\label{sec:results}
+
+% P1 Comparisons and status rule. M0-LSTM (RQ1); M0-M2, M1-M4 (RQ2);
+%    M0-M1 (RQ3); NWM reference only. n = 101 gauged, 98 random hold-out,
+%    29 blocked; no gauged M4. Status: equivalent (Holm TOST p<0.05 at the
+%    margin) / different (Holm Wilcoxon p<0.05, interval excludes 0) /
+%    undetermined. Mean paired difference in days 1-5 NSE (median beside
+%    it), 90% gauge-bootstrap intervals; one training run per model, so
+%    intervals are across gauges. All contrasts: Table~\ref{tab:contrasts}.
+
+%---------------------------------------------------------------------
+\subsection{Skill Across Lead Times and Protocols}
+\label{sec:res-skill}
+% RESULTS
+% P1 Answer + Table 3: days 1-5 median NSE M0 0.430/0.385/0.305,
+%    LSTM 0.428/0.367/0.280, NWM 0.255/0.255/0.183 (gauged/random/blocked).
+%    Skill falls with hold-out strictness for every model. Figure 4 top row:
+%    all 40 leads; curves converge with lead.
+% P2 KGE vs NSE: blocked KGE LSTM 0.381, NWM 0.385, M0 0.334; alpha M0 0.530
+%    vs LSTM 0.626 (blocked); gauged KGE M0 0.526 vs LSTM 0.481.
+%    NWM better than M0 at 6/101, 17/98, 5/29 gauges.
+% P3 Peaks: top-5% bias -0.37 to -0.48 for every model and protocol; peaks
+%    within 24 h timed at 3 h (M0) vs 6 h (LSTM, NWM), blocked 1.5 vs 6 h.
+%    Example event: Figure S3.
+% DISCUSSION
+% P4 NWM is nudged (reference, not competitor). Convergence with lead:
+%    precipitation-forecast error dominates \cite{Cloke2009,Wood2008}.
+% P5 NSE rewards damped forecasts \cite{Gupta2009}: lower alpha of M0,
+%    peak underestimation, relevance for flood warning.
+
+\begin{figure}
+\figfile{figures/fig4_skill_lead.pdf}{\textwidth}
+\caption{Skill against lead time, 6 to 240~h, for the reach-scale model (M0), the LSTM, and the NWM forecast in the (a) gauged ($n = 101$), (b) random hold-out ($n = 98$), and (c) blocked ($n = 29$) protocols. Top: median NSE over gauges. Bottom: paired difference M0 $-$ LSTM, mean over gauges with 90\% gauge-bootstrap band. Days 1--5 are shaded.}
+\label{fig:skill}
+\end{figure}
+
+\input{section5/table3_skill.tex}
+
+%---------------------------------------------------------------------
+\subsection{Reach-Scale Model Versus the Regional LSTM (RQ1)}
+\label{sec:res-rq1}
+% RESULTS
+% P1 Answer: M0 higher on average in all protocols; all undetermined.
+%    Gauged +0.020 [+0.007,+0.035], Holm p 0.053; random +0.015
+%    [-0.010,+0.037], median +0.035, 66% of gauges, Holm p 0.012;
+%    blocked +0.066 [+0.026,+0.105], 69%, Holm p 0.089 (Figure 5 row 1).
+% P2 Lead: random +0.031 (24 h) to -0.003 (120 h); blocked +0.057 to +0.076.
+%    40 leads: mean>0 at 36/13/40, band above 0 at 19/5/34 leads
+%    (Figure 4 bottom).
+% P3 Space (Figure 10): M0 higher at 70,75,79,65 of 98 gauges (6,12,18 h,
+%    days 1-5, random) [add counts to facts sheet before citing].
+%    By area (Figure 8c): equal < 50 km2; M0 higher > 600 km2.
+% DISCUSSION
+% P4 System difference (Section~\ref{sec:baselines}): upper bound on the
+%    network's own contribution.
+% P5 Literature: \citeA{Kirschstein2024} vs \citeA{WangH2025},
+%    \citeA{Mosaffa2026}; our GEFS-driven, withheld-gauge setting.
+% P6 Blocked: transfer to unseen terrain \cite{Feng2021}; 29 gauges in
+%    3 basins and the LSTM's higher blocked KGE: suggestive only.
+
+\begin{figure}
+\figfile{figures/fig5_contrasts.pdf}{0.6\textwidth}
+\caption{Paired differences in days 1--5 NSE for the four contrasts, by protocol: mean over gauges with 90\% gauge-bootstrap interval. The gray band marks the $\pm 0.02$ equivalence margin. M1 $-$ M4 is not available in the gauged protocol.}
+\label{fig:contrasts}
+\end{figure}
+
+\begin{figure}
+\figfile{figures/fig10_gauge_protocol_leads.pdf}{\textwidth}
+\caption{Per-gauge difference in NSE, M0 $-$ LSTM, in the three protocols (rows) at leads of 6, 12, and 18~h and for days 1--5 (columns). Purple: M0 higher; orange: LSTM higher. The scale is clipped at $\pm 0.3$. Numbers give the gauges with M0 higher out of the gauges scored.}
+\label{fig:maps-protocol}
+\end{figure}
+
+%---------------------------------------------------------------------
+\subsection{Message Passing Versus Routing (RQ2)}
+\label{sec:res-rq2}
+% RESULTS
+% P1 Message passing M0-M2: gauged +0.005 [+0.002,+0.009] equivalent
+%    within 0.01; random +0.023 [-0.002,+0.054], median +0.001,
+%    undetermined; blocked -0.013 [-0.038,+0.010] undetermined; sign
+%    +,+,- across protocols.
+% P2 Routing M1-M4: random +0.033 [+0.016,+0.053], median +0.026, 76% of
+%    gauges, Holm p 1.4e-5: different. Positive at every lead 24-120 h
+%    (+0.042 to +0.025); M1 higher at 73-81 of 98 gauges at 6-18 h
+%    (Figure 9). By area: 600-2,000 km2 +0.055 [+0.026,+0.094] (86%),
+%    < 200 km2 +0.005. Blocked -0.006 [-0.037,+0.021], undetermined; sign
+%    changes at every lead.
+% P3 Travel times: Spearman 0.88 with river length; median 10.3 h for
+%    34.3 km; celerity 1.06 m/s. Peak timing (random) M1 3 h vs M4 6 h.
+% DISCUSSION
+% P4 Travel time, not neighbour mixing, is what gauges detect; consistent
+%    with the gain peaking at intermediate basin sizes.
+% P5 Message passing redundant with routed flow and broadcast specific
+%    discharge; three-link reach; \cite{Alon2021,WangH2025}.
+% P6 Differentiable routing \cite{Bindas2024,Song2025}; blocked transfer
+%    of attribute-predicted routing parameters; n = 29.
+
+\begin{figure}
+\figfile{figures/fig9_gauge_contrast_leads.pdf}{\textwidth}
+\caption{Per-gauge difference in NSE in the random hold-out ($n = 98$) for M0 $-$ LSTM, M0 $-$ M2 (message passing), M1 $-$ M4 (routing), and M0 $-$ M1 (insertion) (rows) at leads of 6, 12, and 18~h and for days 1--5 (columns). Purple: first model higher; orange: second model higher. The scale is clipped at $\pm 0.3$. Numbers give the gauges where the first model is higher out of the gauges scored.}
+\label{fig:maps-contrasts}
+\end{figure}
+
+%---------------------------------------------------------------------
+\subsection{The Value of Upstream Observations (RQ3)}
+\label{sec:res-rq3}
+% RESULTS
+% P1 Answer: equivalent at days 1-5. Gauged +0.002 [+0.001,+0.004]
+%    (equivalent within 0.01); random +0.000 [-0.007,+0.007] (equivalent
+%    within 0.02). Blocked +0.012 is not a test (no visible upstream gauge):
+%    noise floor, B1 +0.004, B2 +0.019, B3 +0.018.
+% P2 Where insertion can act (random, 40 nested): 6 h +0.054
+%    [+0.037,+0.072]; 12 h +0.009; 24 h -0.011; days 1-5 -0.003
+%    [-0.018,+0.015]. Headwater about 0. Gauged nested 6 h +0.001
+%    (Figure 7; s5_5a_position_by_lead.csv). Area-matched 12 pairs:
+%    -0.0001 [-0.014,+0.013].
+% P3 Exploratory (one sentence): area-share correlation -0.43 random,
+%    +0.10 gauged; within-gauge test not identifiable (Text S/Figure S4).
+% DISCUSSION
+% P4 Other routes of observations (Section~\ref{sec:ablations}); M0-M1 is
+%    the added value of the routed correction.
+% P5 Median upstream travel time 10.3 h < first daily lead: consistent with
+%    a 6 h-only gain. No-latency assumption makes it an upper bound.
+% P6 Contrast with the expectation of Section~\ref{sec:obs}; practice:
+%    insertion matters for nowcasting, not days 1-5.
+
+\begin{figure}
+\figfile{figures/fig7_upstream.pdf}{\textwidth}
+\caption{Paired difference in NSE, M0 $-$ M1, against lead time at nested gauges with a visible upstream gauge and at headwater gauges in the (a) gauged and (b) random hold-out protocols: mean over gauges with 90\% gauge-bootstrap band.}
+\label{fig:upstream}
+\end{figure}
+
+%---------------------------------------------------------------------
+\subsection{Forecasts at Every Reach}
+\label{sec:res-reach}
+% RESULTS
+% P1 Caveat first: reference = NWM v3.0 retrospective, M0's pretraining
+%    target, never seen by the LSTM; agreement, not accuracy.
+% P2 Median NSE by area (<5, 5-50, 50-500, 500-5,000, >5,000 km2):
+%    M0 0.011, 0.112, 0.211, 0.306, -0.290; LSTM -0.723, 0.050, 0.197,
+%    0.249, -1.449; NWM forecast -1.730, -0.696, -0.150, 0.211, -0.238.
+%    Share NSE>0 (M0) 0.55, 0.81, 0.81, 0.72, 0.38. 529 of 1,569 reaches
+%    > 5,000 km2 scored (Figure 8a,b; Figures S5).
+% P3 Headwater reaches (23,172; median 1.96 km2): median NSE M0 0.014,
+%    LSTM -0.650, NWM -1.643 (Figures S6).
+% P4 Gauges by area (Figure 8c): 0.12 (< 50 km2, n = 3) to 0.48
+%    (600-2,000 km2), random hold-out.
+% DISCUSSION
+% P5 Circularity: M0 inherits the reference at small streams.
+% P6 Evidence gap below 50 km2 (77.7% of reaches; 4 gauges)
+%    \cite{Krabbenhoft2022}.
+
+\begin{figure}
+\figfile{figures/fig8_skill_area.pdf}{\textwidth}
+\caption{Skill by drainage area for M0, the LSTM, and the NWM forecast. (a) Median NSE, days 1--5, at every reach against the NWM v3.0 retrospective, on which M0 was pretrained; (b) share of those reaches with NSE $> 0$; (c) median NSE against observations at the evaluation gauges of the random hold-out. Numbers under the axis give the scored reaches (thousands) or gauges per class.}
+\label{fig:area-skill}
+\end{figure}
+
+%---------------------------------------------------------------------
+\subsection{Limitations}
+\label{sec:limits}
+% P1 One run per model and protocol; noise floor +0.012; +-0.02 margin
+%    pre-chosen.
+% P2 LSTM not input-matched; early checkpoints (13,754 of 68,767 updates).
+% P3 NWM: nudged at withheld gauges; retrospective as pretraining target
+%    and possible calibration at withheld gauges [VERIFY].
+% P4 Blocked: three basins in the eastern highlands, n = 29.
+% P5 Inputs: deterministic GEFS control member; no other forecast
+%    variables; no data latency.
+% P6 Coverage: no gauged M4; every-reach runs for M0 and LSTM only;
+%    retrospective missing at most large reaches.
+
+%---------------------------------------------------------------------
+\subsection{What the River Network Contributes}
+\label{sec:synthesis}
+% One paragraph per RQ answer + one on implications for operational
+% forecasting at unmonitored reaches (structure_md section 2, 5.7).
+
+%=====================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+%=====================================================================
+% One or two sentences per RQ with the headline number; what would change
+% the answers (seeds, more blocked basins, small-stream gauges).

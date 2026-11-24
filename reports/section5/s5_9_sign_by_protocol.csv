@@ -1,0 +1,9 @@
+contrast,protocols,signs,flips
+M0 - LSTM,"Gauged, Random hold-out, Blocked basins","+, +, +",False
+M0 - NWM,"Gauged, Random hold-out, Blocked basins","+, +, +",False
+M0 - M2,"Gauged, Random hold-out, Blocked basins","+, +, -",True
+M0 - M1,"Gauged, Random hold-out, Blocked basins","+, +, +",False
+M1 - LSTM,"Gauged, Random hold-out, Blocked basins","+, +, +",False
+M2 - LSTM,"Gauged, Random hold-out, Blocked basins","+, -, +",True
+M1 - M4,"Random hold-out, Blocked basins","+, -",True
+M4 - LSTM,"Random hold-out, Blocked basins","-, +",True

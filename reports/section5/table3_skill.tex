@@ -1,0 +1,36 @@
+\begin{table}
+\caption{Median NSE and KGE, Days 1--5, by Protocol and Model}
+\label{tab:skill}
+\footnotesize
+\setlength{\parindent}{0pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+Protocol & Model & $n$ & NSE & KGE \\
+\midrule
+Gauged & GNN & 101 & \textbf{0.430} & \textbf{0.526} \\
+ & GNN-noIns & 101 & 0.428 & \textbf{0.526} \\
+ & GNN-noMP & 101 & 0.426 & 0.517 \\
+ & GNN-Instat & --- & \multicolumn{2}{c}{not trained} \\
+ & LSTM & 101 & 0.428 & 0.481 \\
+ & NWM & 101 & 0.255 & 0.443 \\
+\addlinespace
+Random hold-out & GNN & 98 & 0.385 & 0.429 \\
+ & GNN-noIns & 98 & 0.383 & 0.428 \\
+ & GNN-noMP & 98 & \textbf{0.386} & 0.421 \\
+ & GNN-Instat & 98 & 0.379 & 0.421 \\
+ & LSTM & 98 & 0.367 & 0.396 \\
+ & NWM & 98 & 0.255 & \textbf{0.448} \\
+\addlinespace
+Blocked basins & GNN & 29 & 0.305 & 0.334 \\
+ & GNN-noIns & 29 & 0.297 & 0.334 \\
+ & GNN-noMP & 29 & \textbf{0.322} & 0.341 \\
+ & GNN-Instat & 29 & 0.307 & 0.324 \\
+ & LSTM & 29 & 0.280 & 0.381 \\
+ & NWM & 29 & 0.183 & \textbf{0.385} \\
+\bottomrule
+\end{tabular}
+\begin{flushleft}
+\footnotesize \emph{Note.} Median over the $n$ gauges scored by every model of the protocol, per lead, averaged over the leads 24, 48, 72, 96 and 120~h. Bold: the highest value per protocol. Differences below 0.02 NSE are not distinguishable (equivalence margin, Table~S6). GNN-Instat was not trained for the gauged protocol. NWM: operational forecast, nudged toward observations at gauges, a reference only.
+\end{flushleft}
+\end{table}

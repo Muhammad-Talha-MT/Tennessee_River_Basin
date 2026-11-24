@@ -1,0 +1,4 @@
+protocol,gauges,min_pairs_24h,gauges_under_300_pairs,gauges_under_500_pairs
+Gauged,101,355,0,1
+Random hold-out,98,355,0,1
+Blocked basins,29,1459,0,0

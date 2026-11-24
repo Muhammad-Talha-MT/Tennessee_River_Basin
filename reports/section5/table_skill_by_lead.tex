@@ -1,0 +1,42 @@
+\begin{table}
+\centering
+\caption{Median NSE at single lead times}
+\label{tab:skill-leads}
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccc@{}}
+\toprule
+Model & 6~h & 12~h & 18~h & 24~h & 48~h & 72~h & 120~h & 240~h \\
+\midrule
+\multicolumn{9}{l}{\textbf{Gauged} ($n = 101$)} \\
+GNN & \textbf{0.919} & \textbf{0.772} & \textbf{0.667} & \textbf{0.614} & 0.459 & 0.401 & 0.307 & \textbf{0.153} \\
+GNN-noIns & 0.916 & 0.768 & 0.649 & 0.612 & 0.450 & 0.402 & \textbf{0.310} & 0.151 \\
+GNN-noMP & 0.918 & 0.755 & 0.640 & 0.608 & 0.452 & 0.400 & 0.306 & 0.149 \\
+GNN-Instat & --- & --- & --- & --- & --- & --- & --- & --- \\
+\cmidrule{1-9}
+LSTM (baseline) & 0.804 & 0.715 & 0.624 & 0.595 & \textbf{0.487} & \textbf{0.403} & 0.308 & 0.145 \\
+NWM (reference) & 0.837 & 0.628 & 0.534 & 0.461 & 0.335 & 0.244 & 0.079 & $-$0.331 \\
+\midrule
+\multicolumn{9}{l}{\textbf{Random hold-out} ($n = 98$)} \\
+GNN & \textbf{0.770} & 0.721 & 0.639 & 0.567 & 0.443 & \textbf{0.372} & 0.248 & 0.115 \\
+GNN-noIns & 0.769 & \textbf{0.727} & \textbf{0.658} & \textbf{0.569} & \textbf{0.452} & 0.369 & 0.235 & \textbf{0.115} \\
+GNN-noMP & 0.754 & 0.714 & 0.633 & 0.567 & 0.440 & 0.366 & \textbf{0.253} & 0.111 \\
+GNN-Instat & 0.724 & 0.668 & 0.585 & 0.543 & 0.443 & 0.354 & 0.249 & 0.115 \\
+\cmidrule{1-9}
+LSTM (baseline) & 0.690 & 0.655 & 0.548 & 0.518 & 0.429 & 0.361 & 0.236 & 0.099 \\
+NWM (reference) & 0.842 & 0.629 & 0.539 & 0.463 & 0.337 & 0.245 & 0.070 & $-$0.331 \\
+\midrule
+\multicolumn{9}{l}{\textbf{Blocked basins} ($n = 29$)} \\
+GNN & 0.710 & 0.617 & 0.601 & 0.457 & 0.380 & 0.275 & 0.169 & 0.045 \\
+GNN-noIns & 0.718 & 0.620 & \textbf{0.620} & 0.462 & 0.360 & 0.272 & 0.159 & 0.041 \\
+GNN-noMP & 0.688 & 0.624 & 0.586 & 0.463 & \textbf{0.387} & \textbf{0.305} & \textbf{0.201} & 0.041 \\
+GNN-Instat & 0.674 & 0.609 & 0.506 & \textbf{0.485} & 0.381 & 0.293 & 0.159 & \textbf{0.048} \\
+\cmidrule{1-9}
+LSTM (baseline) & \textbf{0.719} & \textbf{0.692} & 0.566 & 0.482 & 0.340 & 0.242 & 0.126 & 0.011 \\
+NWM (reference) & 0.773 & 0.581 & 0.502 & 0.401 & 0.309 & 0.083 & 0.031 & $-$0.187 \\
+\bottomrule
+\end{tabular*}
+\begin{flushleft}
+\footnotesize \emph{Note.} Median over the $n$ gauges at each lead. Bold: highest value among the trained models (reach-scale models and LSTM) in each column of a block. Differences smaller than 0.02 lie within the equivalence margin (Table~S6). GNN-Instat was not trained for the gauged protocol. The LSTM is trained in the same folds but is not matched to the reach-scale models in inputs (Section~\ref{sec:baselines}); the NWM is nudged toward observations, including at withheld gauges, and is a reference only.
+\end{flushleft}
+\end{table}

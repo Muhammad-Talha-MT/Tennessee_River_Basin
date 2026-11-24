@@ -1,0 +1,19 @@
+protocol,model,runs_expected,runs_done,selected_updates,predictions
+Gauged,M0,1,1,2500,yes
+Gauged,M1,1,1,2500,yes
+Gauged,M2,1,1,2500,yes
+Gauged,M4,0,0,-,MISSING (not planned: no all-gauge M4)
+Gauged,LSTM,1,1,13754,yes
+Gauged,NWM,0,0,-,yes (operational archive)
+Random hold-out,M0,5,5,"2000, 2500, 2500, 2000, 2500",yes
+Random hold-out,M1,5,5,"2000, 2500, 2500, 2000, 2500",yes
+Random hold-out,M2,5,5,"2000, 2500, 500, 2000, 2500",yes
+Random hold-out,M4,5,5,"2000, 1500, 2500, 2000, 2500",yes
+Random hold-out,LSTM,5,5,"34385, 20631, 13754, 20631, 20631",yes
+Random hold-out,NWM,0,0,-,yes (operational archive)
+Blocked basins,M0,3,3,"2000, 1500, 2500",yes
+Blocked basins,M1,3,3,"2000, 1500, 2500",yes
+Blocked basins,M2,3,3,"2500, 2500, 2500",yes
+Blocked basins,M4,3,3,"2000, 1500, 2500",yes
+Blocked basins,LSTM,3,3,"61893, 13754, 34385",yes
+Blocked basins,NWM,0,0,-,yes (operational archive)

@@ -324,7 +324,7 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     # Attribution experiments (docs/ATTRIBUTION.md); the defaults reproduce the current model.
     p.add_argument("--off", nargs="*", default=[], choices=ABLATIONS, help="Parts of the river-network design switched off")
-    p.add_argument("--router", choices=["kernel", "manning"], default="kernel", help="Routing: shared group kernels, or Manning travel times per reach (hydro.channel)")
+    p.add_argument("--router", choices=["kernel", "manning", "instant"], default="kernel", help="Routing: shared group kernels, Manning travel times per reach (hydro.channel), or instantaneous summation of upstream lateral inflow (no travel time)")
     p.add_argument("--insert", action="store_true", help="Gauge-flow insertion: visible gauges correct every reach below them (needs --router manning)")
     p.add_argument("--graph-layers", type=int, default=3, help="Graph message-passing layers (0: routed per reach, no graph layers; hop-depth ablation)")
     p.add_argument("--lumped", action="store_true", help="Non-graph control: every reach a lumped basin (model.LumpedModel)")

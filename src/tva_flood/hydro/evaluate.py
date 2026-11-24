@@ -174,6 +174,8 @@ def main():
     p.add_argument("--rains", nargs="+", choices=["gefs", "aorc"], default=["gefs", "aorc"],
                    help="Forecast rain sources scored (aorc: the realized-rain diagnostic)")
     p.add_argument("--no-reaches", action="store_true", help="Skip the every-reach protocol (gauges only, faster)")
+    p.add_argument("--insertion-off", action="store_true",
+                   help="Diagnostic: switch gauge insertion off at inference in every loaded model (the weights are unchanged)")
     p.add_argument("--only-folds", type=int, nargs="+", help="Score only these folds (their fold models must exist; the other folds' gauges stay unscored)")
     p.add_argument("--heldout-only", action="store_true",
                    help="Only the held-out protocol: no all-gauge model (--model is ignored), no gauged or every-reach scores")
@@ -221,6 +223,9 @@ def evaluate(a, rank, world, device):
         withheld[k] = splits.withheld(gauges, network, k, scheme, split.get("keep", 1.0), split.get("keep_seed", 0))
         if split.get("keep", 1.0) <= 0:
             withheld[k] = np.ones(gauges.count, bool)
+    if a.insertion_off:  # counterfactual for the insertion audit: same weights, no insertion at test time
+        for m in models.values():
+            m.config["insert"] = False
     a.loaded_folds = sorted(fold_states)
     a.split = (fold_states[a.loaded_folds[0]].get("split") or dict(scheme=scheme))
     reach_model = torch.as_tensor(np.maximum(reach_fold, 0), device=device)
@@ -480,7 +485,7 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
     for name in ("nwm", "persistence", "climatology"):
         nse, scored = mine_u[name]
         rows.append(row(f"{name} (reference: may use these gauges)", medians(nse, scored)))
-    count = int(np.isfinite(np.where(mine_u["hydro+gefs"][1], mine_u["hydro+gefs"][0], np.nan)[3]).sum())
+    count = int(np.isfinite(np.where(mine_u[f"hydro+{a.rains[0]}"][1], mine_u[f"hydro+{a.rains[0]}"][0], np.nan)[3]).sum())
     lines += ["", f"## 2. Ungauged: {count} held-out gauges ({len(set(np.unique(reach_fold)) - {-1, 0})} {a.scheme} folds) against USGS", ""] + rows
     # By dams ----------------------------------------------------------------------------
     regulated, groups = regulation(network, gauges)
@@ -493,7 +498,7 @@ def write(a, out, s, acc, issues, every_reach, reach_fold, world):
             lstm_nse = _by_station(lstm_nse, names)
         for scope, m in groups:
             m = m & keep
-            nse, scored = table_["hydro+gefs"]
+            nse, scored = table_[f"hydro+{a.rains[0]}"]
             cells = [days_1_5(nse, scored, m), days_1_5(*table_["nwm"], m)]
             lstm_cell = "-" if lstm_nse is None else f"{days_1_5(lstm_nse, None, m):.3f}"
             count = int(scored[DAYS_1_5[0] // 6 - 1][m].sum())  # gauges scored at 24 h

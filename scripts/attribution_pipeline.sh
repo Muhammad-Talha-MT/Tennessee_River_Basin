@@ -116,6 +116,7 @@ variant_args() {  # the stage-B arguments of a variant
     M0) echo "--router manning --insert --init $A/manning_A/best.pt ${B_UPDATES[*]}" ;;  # Manning routing + gauge-flow insertion
     M1) echo "--router manning --init $A/manning_A/best.pt ${B_UPDATES[*]}" ;;  # M0 without insertion
     M2) echo "--router manning --insert --graph-layers 0 --init $A/manning0_A/best.pt ${B_UPDATES[*]}" ;;  # M0 without graph layers
+    M4) echo "--router instant --init $A/instant_A/best.pt ${B_UPDATES[*]}" ;;  # M1 without routing: instantaneous summation of upstream lateral inflow (own stage A)
     *) echo "unknown variant $1" >&2; return 1 ;;
   esac
 }
@@ -157,7 +158,7 @@ train_all_gpus() {  # train_all_gpus NAME [train arguments]: one run over every 
 
 train_as_all() {  # train_as_all NAME VARIANT SEED FOLD [extra arguments]: train_as, one run over every GPU (2 samples x 4 GPUs x 1 = 8 per update; same sample list as one GPU)
   local name=$1 v=$2 seed=$3 fold=$4; shift 4
-  case $v in M0 | M1) wait_for "$A/manning_A" || return 1 ;; M2) wait_for "$A/manning0_A" || return 1 ;; esac
+  case $v in M0 | M1) wait_for "$A/manning_A" || return 1 ;; M2) wait_for "$A/manning0_A" || return 1 ;; M4) wait_for "$A/instant_A" || return 1 ;; esac
   local common=() skip=0 x
   for x in "${B_COMMON[@]}"; do  # drop --accumulate N: train_all_gpus sets it
     if [ $skip = 1 ]; then skip=0; elif [ "$x" = --accumulate ]; then skip=1; else common+=("$x"); fi
@@ -170,6 +171,12 @@ MANNING_A=(--stage A --router manning --updates 5000 --lr 5e-4 --warmup 500 --va
 
 manning_stage_a() {  # the Manning-router stage A with 3 graph layers, on every GPU (same budget as models/gefs_hydro_A)
   train_all_gpus manning_A "${MANNING_A[@]}" --graph-layers 3
+}
+
+INSTANT_A=(--stage A --router instant --updates 5000 --lr 5e-4 --warmup 500 --validate-every 1000 --resume --workers "$TRAIN_WORKERS")
+
+instant_stage_a() {  # M4's NWM pretraining: M1's stage A (3 graph layers) with the instantaneous router instead of the Manning router; every other setting identical
+  train_all_gpus instant_A "${INSTANT_A[@]}" --graph-layers 3
 }
 
 manning0_stage_a() {  # manning0_stage_a GPU: the same without graph layers, one GPU (8 samples per update, the same list)
@@ -462,6 +469,16 @@ case $PHASE in
     for b in 1 2 3; do seq_job "S1_M2_s1_b$b" M2 1 $b --scheme blocked; done
     for fold in 1 2 3 4 5 0; do seq_job "M1_s1$(suffix $fold)" M1 1 $fold; done
     say "routing trainings finished" ;;
+  blocked_m1)  # M1 on the 3 blocked folds (existing recipe), one run at a time over the GPUs in $GPUS (use GPUS="0 1": 2 x 4 samples per update = 8)
+    seq_job() { train_as_all "$@" || say "job failed: $*"; }
+    for b in 1 2 3; do seq_job "S1_M1_s1_b$b" M1 1 $b --scheme blocked; done
+    say "M1 blocked trainings finished" ;;
+  m4)  # M4 = M1 without routing: stage A, then the 5 held-out folds and the 3 blocked folds (no all-gauge model); over the GPUs in $GPUS
+    instant_stage_a
+    seq_job() { train_as_all "$@" || say "job failed: $*"; }
+    for fold in 1 2 3 4 5; do seq_job "M4_s1_f$fold" M4 1 $fold; done
+    for b in 1 2 3; do seq_job "S1_M4_s1_b$b" M4 1 $b --scheme blocked; done
+    say "M4 trainings finished" ;;
   routing_eval)  # M0 in full (every-reach and realized-rain protocols too); M2 and M1 on the gauges
     G=-1; nextg() { G=$(( (G + 1) % 4 )); }
     nextg; evaluate_variant M0 1 "$G"

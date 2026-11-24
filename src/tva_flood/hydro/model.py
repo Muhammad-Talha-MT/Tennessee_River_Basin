@@ -326,7 +326,7 @@ class HydroModel(nn.Module):
     def __init__(self, groups, delay, hidden=128, channels=32, graph_layers=3, quantiles=False, head=None, off=(), router="kernel", insert=False):
         super().__init__()
         off = tuple(sorted(set(off)))
-        if router not in ("kernel", "manning"):
+        if router not in ("kernel", "manning", "instant"):
             raise ValueError(f"Unknown router {router}")
         if insert and router != "manning":
             raise ValueError("Gauge-flow insertion needs the Manning router")
@@ -346,7 +346,7 @@ class HydroModel(nn.Module):
         if off:
             self.config["off"] = list(off)
         if router != "kernel":
-            self.config["router"] = router  # channel.ManningRouter
+            self.config["router"] = router  # "manning": channel.ManningRouter; "instant": Router without travel time
         if insert:
             self.config["insert"] = True  # gauge-flow insertion (channel module docstring)
         self.off = set(off)
@@ -359,6 +359,12 @@ class HydroModel(nn.Module):
             if "routing" in self.off:
                 raise ValueError("The routing ablation is a kernel-router setting")
             self.router = ManningRouter()
+        elif router == "instant":
+            # no routing: the flow at a reach is the instantaneous sum of its upstream lateral inflow, with the same mass shares as the
+            # Manning router (network.share) and zero travel time (every kernel has all its weight on the first tap, not trainable)
+            if "routing" in self.off:
+                raise ValueError("router='instant' already removes the routing")
+            self.router = Router(groups, delay, learned=False)
         else:
             self.router = Router(groups, delay, learned="routing" not in self.off)
         self.head = GaugeHead(**(head or {}))
